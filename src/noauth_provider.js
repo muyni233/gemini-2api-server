@@ -7,9 +7,7 @@
  * page, mirroring web2api's auto-update + 405 retry.
  *
  * Multi-turn is simulated by folding history into the prompt (same as
- * web2api). The current anonymous page exposes the same resumable upload
- * tokens used by Gemini Web, so media references can be uploaded before
- * StreamGenerate without a Google login.
+ * web2api). Anonymous StreamGenerate supports text only.
  */
 export const DEFAULT_NOAUTH_MODEL = 'gemini-3.8-flash';
 
@@ -38,11 +36,30 @@ export const NOAUTH_MODEL_NAMES = Object.freeze(Object.keys(MODELS));
 const FALLBACK_BL = 'boq_assistant-bard-web-server_20260716.08_p0';
 const BL_PATTERN = /(boq_assistant-bard-web-server_\d+\.\d+_p\d+)/;
 const USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36';
-const UPLOAD_ENDPOINT = 'https://push.clients6.google.com/upload/';
-const UPLOAD_TOKEN_TTL_MS = 10 * 60 * 1000;
+const PAGE_TIMEOUT_MS = 15_000;
+const GENERATION_TIMEOUT_MS = 180_000;
 
 let cachedBl = '';
-let cachedUploadTokens = null;
+
+function withTimeout(signal, timeoutMs) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(new Error('Request timed out.')), timeoutMs);
+    timer.unref?.();
+    const abortFromParent = () => controller.abort(signal?.reason);
+    controller.signal.addEventListener(
+        'abort',
+        () => {
+            clearTimeout(timer);
+            signal?.removeEventListener('abort', abortFromParent);
+        },
+        { once: true }
+    );
+    if (signal) {
+        if (signal.aborted) abortFromParent();
+        else signal.addEventListener('abort', abortFromParent, { once: true });
+    }
+    return controller.signal;
+}
 
 function resolveModel(modelName) {
     let name = String(modelName || '').trim() || DEFAULT_NOAUTH_MODEL;
@@ -69,11 +86,12 @@ function resolveModel(modelName) {
     return { ...cfg, modelId: cfg.mode, thinkMode: thinkOverride ?? cfg.think };
 }
 
-async function fetchLatestBl() {
+async function fetchLatestBl(signal) {
     try {
         const response = await fetch('https://gemini.google.com/app', {
             headers: { 'User-Agent': USER_AGENT },
             credentials: 'omit',
+            signal: withTimeout(signal, PAGE_TIMEOUT_MS),
         });
         if (!response.ok) return null;
         const html = await response.text();
@@ -84,185 +102,17 @@ async function fetchLatestBl() {
     }
 }
 
-async function getBl(forceRefresh = false) {
+async function getBl(forceRefresh = false, signal) {
     if (!cachedBl || forceRefresh) {
-        const latest = await fetchLatestBl();
+        const latest = await fetchLatestBl(signal);
         if (latest) cachedBl = latest;
     }
     return cachedBl || FALLBACK_BL;
 }
 
-function extractPageToken(html, key) {
-    const match = String(html || '').match(new RegExp(`"${key}":"([^"]+)`));
-    return match ? match[1] : '';
-}
-
-async function fetchUploadTokens(forceRefresh = false) {
-    if (
-        !forceRefresh &&
-        cachedUploadTokens &&
-        cachedUploadTokens.expiresAt > Date.now() &&
-        cachedUploadTokens.pushId &&
-        cachedUploadTokens.clientPctx
-    ) {
-        return cachedUploadTokens;
-    }
-
-    const response = await fetch('https://gemini.google.com/app', {
-        headers: { 'User-Agent': USER_AGENT },
-        credentials: 'omit',
-    });
-    if (!response.ok) {
-        throw new Error(`Gemini upload token fetch failed: HTTP ${response.status}`);
-    }
-
-    const html = await response.text();
-    const pushId = extractPageToken(html, 'qKIAYe');
-    const clientPctx = extractPageToken(html, 'Ylro7b');
-    if (!pushId || !clientPctx) {
-        throw new Error('Gemini upload tokens are unavailable on the anonymous page.');
-    }
-
-    cachedUploadTokens = {
-        pushId,
-        clientPctx,
-        expiresAt: Date.now() + UPLOAD_TOKEN_TTL_MS,
-    };
-    return cachedUploadTokens;
-}
-
-function readHeader(response, name) {
-    return response?.headers?.get?.(name) || response?.headers?.get?.(name.toLowerCase()) || '';
-}
-
-function decodeDataUrl(value) {
-    const match = String(value || '').match(/^data:([^;,]+)?(;base64)?,([\s\S]*)$/i);
-    if (!match) return null;
-
-    const mimeType = match[1] || 'application/octet-stream';
-    try {
-        const bytes = match[2]
-            ? Buffer.from(match[3].replace(/\s+/g, ''), 'base64')
-            : Buffer.from(decodeURIComponent(match[3]), 'utf8');
-        if (bytes.length === 0) return null;
-        return { bytes, mimeType };
-    } catch {
-        return null;
-    }
-}
-
-async function readMediaSource(media, signal) {
-    if (media?.data) {
-        const decoded = decodeDataUrl(media.data);
-        if (!decoded) throw new Error('Invalid media data URL.');
-        return { ...decoded, name: media.name || 'upload' };
-    }
-
-    const uri = media?.uri || media?.url;
-    if (typeof uri !== 'string' || !uri) throw new Error('Media part is missing data or fileUri.');
-    if (uri.startsWith('/contrib_service/')) return { fileRef: uri };
-
-    let parsed;
-    try {
-        parsed = new URL(uri);
-    } catch {
-        throw new Error('fileUri must be an https:// or http:// URL.');
-    }
-    if (!['http:', 'https:'].includes(parsed.protocol)) {
-        throw new Error('fileUri must use http:// or https://.');
-    }
-
-    const response = await fetch(parsed, {
-        headers: { 'User-Agent': USER_AGENT },
-        signal,
-        credentials: 'omit',
-    });
-    if (!response.ok) throw new Error(`Media download failed: HTTP ${response.status}`);
-    const bytes = Buffer.from(await response.arrayBuffer());
-    if (bytes.length === 0) throw new Error('Media download returned an empty file.');
-    return {
-        bytes,
-        mimeType:
-            media.mimeType || readHeader(response, 'content-type') || 'application/octet-stream',
-        name: media.name || parsed.pathname.split('/').pop() || 'download',
-    };
-}
-
-async function uploadFileReference(file, signal) {
-    if (file.fileRef) return file.fileRef;
-
-    let tokens;
-    try {
-        tokens = await fetchUploadTokens();
-    } catch (error) {
-        cachedUploadTokens = null;
-        tokens = await fetchUploadTokens(true).catch(() => {
-            throw error;
-        });
-    }
-
-    const startResponse = await fetch(UPLOAD_ENDPOINT, {
-        method: 'POST',
-        headers: {
-            'Push-ID': tokens.pushId,
-            'X-Tenant-Id': 'bard-storage',
-            'X-Client-Pctx': tokens.clientPctx,
-            'X-Goog-Upload-Header-Content-Length': String(file.bytes.length),
-            'X-Goog-Upload-Header-Content-Type': file.mimeType,
-            'X-Goog-Upload-Protocol': 'resumable',
-            'X-Goog-Upload-Command': 'start',
-            'Content-Type': 'application/x-www-form-urlencoded;charset=utf-8',
-            'User-Agent': USER_AGENT,
-        },
-        body: `File name: ${file.name || 'upload'}`,
-        signal,
-        credentials: 'omit',
-    });
-    if (!startResponse.ok) {
-        throw new Error(`Media upload start failed: HTTP ${startResponse.status}`);
-    }
-    const uploadUrl = readHeader(startResponse, 'x-goog-upload-url');
-    if (!uploadUrl) throw new Error('Media upload start returned no upload URL.');
-
-    const finalizeResponse = await fetch(uploadUrl, {
-        method: 'POST',
-        headers: {
-            'X-Goog-Upload-Command': 'upload, finalize',
-            'X-Goog-Upload-Offset': '0',
-            'Content-Type': file.mimeType,
-            'User-Agent': USER_AGENT,
-        },
-        body: file.bytes,
-        signal,
-        credentials: 'omit',
-    });
-    if (!finalizeResponse.ok) {
-        throw new Error(`Media upload failed: HTTP ${finalizeResponse.status}`);
-    }
-    const fileRef = (await finalizeResponse.text()).trim();
-    if (!fileRef.startsWith('/'))
-        throw new Error('Media upload returned an invalid file reference.');
-    return fileRef;
-}
-
-/** Upload Gemini inlineData/fileData parts and return StreamGenerate refs. */
-export async function uploadMediaParts(mediaParts, signal) {
-    if (!Array.isArray(mediaParts) || mediaParts.length === 0) return [];
-    const refs = [];
-    for (const media of mediaParts) {
-        const file = await readMediaSource(media, signal);
-        refs.push(await uploadFileReference(file, signal));
-    }
-    return refs;
-}
-
-function buildPayload(prompt, modelId, thinkMode, fileRefs, extraFields) {
+function buildPayload(prompt, modelId, thinkMode, extraFields) {
     const inner = new Array(102).fill(null);
-    if (fileRefs && fileRefs.length > 0) {
-        inner[0] = [prompt, 0, null, fileRefs.map((ref) => [null, null, ref]), null, null, 0];
-    } else {
-        inner[0] = [prompt, 0, null, null, null, null, 0];
-    }
+    inner[0] = [prompt, 0, null, null, null, null, 0];
     inner[1] = ['en'];
     inner[2] = ['', '', '', null, null, null, null, null, null, ''];
     inner[6] = [0];
@@ -337,36 +187,26 @@ function buildHeaders() {
     };
 }
 
-export function resolveNoAuthModel(modelName) {
-    return resolveModel(modelName);
-}
-
 /**
  * Sends a single message through the anonymous StreamGenerate protocol.
  * Returns { text } or { text, truncated: true, error } on mid-stream failure.
  */
-export async function sendNoAuthGeminiMessage(
-    prompt,
-    model,
-    files,
-    signal,
-    onUpdate,
-    options = {}
-) {
+export async function sendNoAuthGeminiMessage(prompt, model, files, signal, onUpdate) {
     const { modelId, thinkMode, extra } = resolveModel(model);
-    const body = buildPayload(prompt, modelId, thinkMode, options.fileRefs || null, extra);
+    const body = buildPayload(prompt, modelId, thinkMode, extra);
+    const requestSignal = withTimeout(signal, GENERATION_TIMEOUT_MS);
 
     // One retry after refreshing bl on upstream rejection (405 / BardErrorInfo),
     // matching gemini-web2api's auto-update behaviour.
     for (let attempt = 0; attempt < 2; attempt++) {
-        const bl = await getBl(attempt === 1);
+        const bl = await getBl(attempt === 1, requestSignal);
         debugLog(`[No-Auth Gemini] POST StreamGenerate (${bl}, attempt ${attempt + 1})`);
 
         let response;
         try {
             response = await fetch(buildEndpoint(bl), {
                 method: 'POST',
-                signal,
+                signal: requestSignal,
                 headers: buildHeaders(),
                 credentials: 'omit',
                 body,

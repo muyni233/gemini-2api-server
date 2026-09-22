@@ -148,23 +148,14 @@ describe('Gemini 2API server', () => {
         assert.ok(!text.includes('data: [DONE]'));
     });
 
-    it('uploads inlineData before sending the StreamGenerate request', async () => {
-        let uploadedParts = [];
-        let providerOptions;
-        sendMessage = async (prompt, model, files, signal, onUpdate, options) => {
-            providerOptions = options;
-            return { text: 'The image is a pixel.' };
+    it('rejects media input before contacting the upstream', async () => {
+        let called = false;
+        sendMessage = async () => {
+            called = true;
+            return { text: 'unexpected' };
         };
         await stopServer();
-        server = createGemini2ApiServer({
-            sendMessage,
-            uploadMediaParts: async (parts) => {
-                uploadedParts = parts;
-                return ['/contrib_service/ttl_1d/test-image'];
-            },
-        });
-        await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
-        baseUrl = `http://127.0.0.1:${server.address().port}`;
+        await startServer();
 
         const response = await fetch(`${baseUrl}/v1beta/models/gemini-3.8-flash:generateContent`, {
             method: 'POST',
@@ -181,10 +172,49 @@ describe('Gemini 2API server', () => {
                 ],
             }),
         });
+        const body = await response.json();
 
-        assert.equal(response.status, 200);
-        assert.equal(uploadedParts.length, 1);
-        assert.equal(uploadedParts[0].mimeType, 'image/png');
-        assert.deepEqual(providerOptions.fileRefs, ['/contrib_service/ttl_1d/test-image']);
+        assert.equal(response.status, 400);
+        assert.equal(body.error.status, 'INVALID_ARGUMENT');
+        assert.match(body.error.message, /supports text only/i);
+        assert.equal(called, false);
+    });
+
+    it('returns 413 for an oversized JSON body', async () => {
+        await stopServer();
+        server = createGemini2ApiServer({ maxBodyBytes: 32, sendMessage });
+        await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+        baseUrl = `http://127.0.0.1:${server.address().port}`;
+
+        const response = await fetch(`${baseUrl}/v1beta/models/gemini-3.8-flash:generateContent`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                contents: [{ role: 'user', parts: [{ text: 'x'.repeat(100) }] }],
+            }),
+        });
+
+        assert.equal(response.status, 413);
+        assert.equal((await response.json()).error.status, 'RESOURCE_EXHAUSTED');
+    });
+
+    it('returns 400 for malformed model URL encoding', async () => {
+        const response = await fetch(`${baseUrl}/v1beta/models/%E0%A4%A:generateContent`, {
+            method: 'POST',
+            body: '{}',
+        });
+
+        assert.equal(response.status, 400);
+        assert.equal((await response.json()).error.status, 'INVALID_ARGUMENT');
+    });
+
+    it('rejects models that are not in the anonymous catalogue', async () => {
+        const response = await fetch(`${baseUrl}/v1beta/models/not-a-real-model:generateContent`, {
+            method: 'POST',
+            body: JSON.stringify({ contents: [{ role: 'user', parts: [{ text: 'hi' }] }] }),
+        });
+
+        assert.equal(response.status, 404);
+        assert.equal((await response.json()).error.status, 'NOT_FOUND');
     });
 });

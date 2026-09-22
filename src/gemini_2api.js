@@ -3,7 +3,6 @@ import {
     DEFAULT_NOAUTH_MODEL,
     NOAUTH_MODEL_NAMES,
     sendNoAuthGeminiMessage,
-    uploadMediaParts,
 } from './noauth_provider.js';
 
 export const DEFAULT_HOST = '127.0.0.1';
@@ -15,8 +14,6 @@ const GENERATE_METHODS = new Set(['generateContent', 'streamGenerateContent']);
 const ROLE_NAMES = new Set(['user', 'model', 'assistant']);
 
 const MODEL_DESCRIPTION = Object.freeze({
-    inputTokenLimit: 1_000_000,
-    outputTokenLimit: 65_536,
     supportedGenerationMethods: ['generateContent', 'streamGenerateContent'],
 });
 
@@ -121,6 +118,14 @@ function normalizePath(pathname) {
     return withoutTrailingSlash || '/';
 }
 
+function decodePathPart(value) {
+    try {
+        return decodeURIComponent(value);
+    } catch {
+        throw new GeminiApiError(400, 'Request path contains invalid URL encoding.');
+    }
+}
+
 function parseModelPath(pathname) {
     const parts = normalizePath(pathname).split('/').filter(Boolean);
     if (API_VERSION_PREFIXES.has(parts[0])) parts.shift();
@@ -129,11 +134,11 @@ function parseModelPath(pathname) {
     const modelAndMethod = parts.slice(1).join('/');
     const methodIndex = modelAndMethod.lastIndexOf(':');
     if (methodIndex === -1) {
-        return { model: decodeURIComponent(modelAndMethod), method: null };
+        return { model: decodePathPart(modelAndMethod), method: null };
     }
 
     return {
-        model: decodeURIComponent(modelAndMethod.slice(0, methodIndex)),
+        model: decodePathPart(modelAndMethod.slice(0, methodIndex)),
         method: modelAndMethod.slice(methodIndex + 1),
     };
 }
@@ -172,46 +177,29 @@ function isObject(value) {
 }
 
 function readTextPart(part) {
-    if (typeof part === 'string') return { text: part, media: null };
+    if (typeof part === 'string') return part;
     if (!isObject(part)) {
         throw new GeminiApiError(400, 'Each content part must be an object or text string.', {
             param: 'contents.parts',
         });
     }
 
-    if (typeof part.text === 'string') return { text: part.text, media: null };
+    if (typeof part.text === 'string') return part.text;
 
     if (part.inlineData || part.inline_data) {
-        const data = part.inlineData || part.inline_data;
-        if (!isObject(data) || typeof data.data !== 'string') {
-            throw new GeminiApiError(400, 'inlineData must contain a base64 data field.', {
-                param: 'contents.parts.inlineData',
-            });
-        }
-        return {
-            text: '[Media attached]',
-            media: {
-                data: `data:${data.mimeType || data.mime_type || 'application/octet-stream'};base64,${data.data}`,
-                mimeType: data.mimeType || data.mime_type || 'application/octet-stream',
-            },
-        };
+        throw new GeminiApiError(
+            400,
+            'This no-auth server supports text only. Use the official Gemini API or a separate cookie-authenticated Web bridge for media.',
+            { param: 'contents.parts.inlineData' }
+        );
     }
 
     if (part.fileData || part.file_data) {
-        const data = part.fileData || part.file_data;
-        const fileUri = data?.fileUri || data?.file_uri;
-        if (!isObject(data) || typeof fileUri !== 'string' || !fileUri) {
-            throw new GeminiApiError(400, 'fileData must contain a fileUri field.', {
-                param: 'contents.parts.fileData',
-            });
-        }
-        return {
-            text: '[Media attached]',
-            media: {
-                uri: fileUri,
-                mimeType: data.mimeType || data.mime_type || 'application/octet-stream',
-            },
-        };
+        throw new GeminiApiError(
+            400,
+            'This no-auth server supports text only. Use the official Gemini API or a separate cookie-authenticated Web bridge for media.',
+            { param: 'contents.parts.fileData' }
+        );
     }
 
     if (part.functionCall || part.function_call) {
@@ -222,10 +210,7 @@ function readTextPart(part) {
             });
         }
         const id = typeof call.id === 'string' && call.id ? ` id="${call.id}"` : '';
-        return {
-            text: `<function_call_result name="${call.name}"${id}>${JSON.stringify(call.args || {})}</function_call_result>`,
-            media: null,
-        };
+        return `<function_call_result name="${call.name}"${id}>${JSON.stringify(call.args || {})}</function_call_result>`;
     }
 
     if (part.functionResponse || part.function_response) {
@@ -237,20 +222,17 @@ function readTextPart(part) {
         }
         const id =
             typeof response.id === 'string' && response.id ? ` (call id: ${response.id})` : '';
-        return {
-            text: `Tool response for ${response.name}${id}: ${JSON.stringify(response.response ?? {})}`,
-            media: null,
-        };
+        return `Tool response for ${response.name}${id}: ${JSON.stringify(response.response ?? {})}`;
     }
 
     if (part.executableCode || part.executable_code) {
         const executable = part.executableCode || part.executable_code;
-        return { text: `Executable code result: ${JSON.stringify(executable)}`, media: null };
+        return `Executable code result: ${JSON.stringify(executable)}`;
     }
 
     if (part.codeExecutionResult || part.code_execution_result) {
         const result = part.codeExecutionResult || part.code_execution_result;
-        return { text: `Code execution result: ${JSON.stringify(result)}`, media: null };
+        return `Code execution result: ${JSON.stringify(result)}`;
     }
 
     throw new GeminiApiError(400, 'Each content part must contain text.', {
@@ -262,15 +244,10 @@ function readParts(parts, param = 'contents.parts') {
     if (!Array.isArray(parts) || parts.length === 0) {
         throw new GeminiApiError(400, 'Each content must contain at least one part.', { param });
     }
-    const parsedParts = parts.map((part) => readTextPart(part));
-    const media = parsedParts.map((part) => part.media).filter(Boolean);
-    return {
-        text: parsedParts
-            .map((part) => part.text)
-            .filter((text) => text.length > 0)
-            .join('\n'),
-        media,
-    };
+    return parts
+        .map((part) => readTextPart(part))
+        .filter((text) => text.length > 0)
+        .join('\n');
 }
 
 function normalizeContent(content, index) {
@@ -285,8 +262,8 @@ function normalizeContent(content, index) {
             param: `contents[${index}].role`,
         });
     }
-    const parsed = readParts(content.parts, `contents[${index}].parts`);
-    return { role: role === 'assistant' ? 'model' : role, text: parsed.text, media: parsed.media };
+    const text = readParts(content.parts, `contents[${index}].parts`);
+    return { role: role === 'assistant' ? 'model' : role, text };
 }
 
 function readSystemInstruction(systemInstruction) {
@@ -297,7 +274,7 @@ function readSystemInstruction(systemInstruction) {
             param: 'systemInstruction',
         });
     }
-    return readParts(systemInstruction.parts, 'systemInstruction.parts').text.trim();
+    return readParts(systemInstruction.parts, 'systemInstruction.parts').trim();
 }
 
 function getFunctionDeclarations(tools) {
@@ -425,7 +402,6 @@ function buildPrompt(request) {
     const declarations = getFunctionDeclarations(request.tools);
     const toolMode = readToolMode(request.toolConfig || request.tool_config);
     const sections = [];
-    const media = contents.flatMap((content) => content.media || []);
 
     if (system) sections.push(`System instruction:\n${system}`);
 
@@ -448,7 +424,6 @@ function buildPrompt(request) {
         declarations,
         toolMode,
         contents,
-        media,
     };
 }
 
@@ -576,10 +551,10 @@ function normalizeProviderResult(result) {
     return { text: typeof result.text === 'string' ? result.text : '', ...result };
 }
 
-async function callProvider({ prompt, model, signal, onUpdate, fileRefs, sendMessage }) {
+async function callProvider({ prompt, model, signal, onUpdate, sendMessage }) {
     let result;
     try {
-        result = await sendMessage(prompt, model, [], signal, onUpdate, { fileRefs });
+        result = await sendMessage(prompt, model, [], signal, onUpdate);
     } catch (error) {
         if (error?.name === 'AbortError' || signal?.aborted) throw error;
         throw new GeminiApiError(502, `Gemini upstream request failed: ${getErrorMessage(error)}`, {
@@ -607,12 +582,12 @@ async function callProvider({ prompt, model, signal, onUpdate, fileRefs, sendMes
 async function readRequestBody(request, maxBodyBytes) {
     return await new Promise((resolve, reject) => {
         let size = 0;
+        let tooLarge = false;
         const chunks = [];
         request.on('data', (chunk) => {
             size += chunk.length;
             if (size > maxBodyBytes) {
-                reject(new GeminiApiError(413, `Request body exceeds ${maxBodyBytes} bytes.`));
-                request.destroy();
+                tooLarge = true;
                 return;
             }
             chunks.push(chunk);
@@ -620,6 +595,10 @@ async function readRequestBody(request, maxBodyBytes) {
         request.on('aborted', () => reject(new GeminiApiError(499, 'Client closed the request.')));
         request.on('error', (error) => reject(error));
         request.on('end', () => {
+            if (tooLarge) {
+                reject(new GeminiApiError(413, `Request body exceeds ${maxBodyBytes} bytes.`));
+                return;
+            }
             if (size === 0) {
                 reject(new GeminiApiError(400, 'Request body must be a JSON object.'));
                 return;
@@ -644,6 +623,10 @@ function getActionPath(pathname) {
 
 function getRequestModel(model) {
     const normalized = normalizeModelId(model);
+    const baseModel = normalized.split('@', 1)[0];
+    if (!getModelNames().includes(baseModel)) {
+        throw new GeminiApiError(404, `Model ${baseModel} not found.`);
+    }
     return normalized;
 }
 
@@ -656,23 +639,12 @@ async function handleGenerate(request, response, options, model, method) {
     const context = buildPrompt(body);
     const targetModel = getRequestModel(model);
     const stream = method === 'streamGenerateContent';
-    let fileRefs = [];
-    if (context.media.length > 0) {
-        try {
-            fileRefs = await options.uploadMediaParts(context.media, request.signal);
-        } catch (error) {
-            throw new GeminiApiError(502, `Gemini media upload failed: ${getErrorMessage(error)}`, {
-                statusText: 'BAD_GATEWAY',
-            });
-        }
-    }
 
     if (!stream) {
         const result = await callProvider({
             prompt: context.prompt,
             model: targetModel,
             signal: request.signal,
-            fileRefs,
             sendMessage: options.sendMessage,
         });
         writeJson(
@@ -695,6 +667,15 @@ async function handleGenerate(request, response, options, model, method) {
     response.once('close', () => {
         if (!response.writableEnded) controller.abort();
     });
+    const heartbeat = setInterval(() => {
+        if (response.writableEnded || response.destroyed) return;
+        try {
+            response.write(': keep-alive\n\n');
+        } catch {
+            controller.abort();
+        }
+    }, 10_000);
+    heartbeat.unref?.();
 
     const shouldBufferForTools =
         context.declarations.length > 0 && context.toolMode.mode !== 'NONE';
@@ -706,7 +687,6 @@ async function handleGenerate(request, response, options, model, method) {
             prompt: context.prompt,
             model: targetModel,
             signal: controller.signal,
-            fileRefs,
             sendMessage: options.sendMessage,
             onUpdate: shouldBufferForTools
                 ? undefined
@@ -770,6 +750,7 @@ async function handleGenerate(request, response, options, model, method) {
         writeSse(response, createErrorBody(error));
         endSse(response);
     } finally {
+        clearInterval(heartbeat);
         request.off('aborted', abort);
     }
 }
@@ -853,15 +834,11 @@ export function createGemini2ApiServer(options = {}) {
     const resolvedOptions = {
         maxBodyBytes: DEFAULT_MAX_BODY_BYTES,
         sendMessage: sendNoAuthGeminiMessage,
-        uploadMediaParts,
         ...options,
     };
 
     if (typeof resolvedOptions.sendMessage !== 'function') {
         throw new TypeError('sendMessage must be a function.');
-    }
-    if (typeof resolvedOptions.uploadMediaParts !== 'function') {
-        throw new TypeError('uploadMediaParts must be a function.');
     }
 
     return createServer(async (request, response) => {
