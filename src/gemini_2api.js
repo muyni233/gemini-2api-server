@@ -3,6 +3,7 @@ import {
     DEFAULT_NOAUTH_MODEL,
     NOAUTH_MODEL_NAMES,
     sendNoAuthGeminiMessage,
+    uploadMediaParts,
 } from './noauth_provider.js';
 
 export const DEFAULT_HOST = '127.0.0.1';
@@ -171,21 +172,46 @@ function isObject(value) {
 }
 
 function readTextPart(part) {
-    if (typeof part === 'string') return part;
+    if (typeof part === 'string') return { text: part, media: null };
     if (!isObject(part)) {
         throw new GeminiApiError(400, 'Each content part must be an object or text string.', {
             param: 'contents.parts',
         });
     }
 
-    if (typeof part.text === 'string') return part.text;
+    if (typeof part.text === 'string') return { text: part.text, media: null };
 
-    if (part.inlineData || part.inline_data || part.fileData || part.file_data) {
-        throw new GeminiApiError(
-            400,
-            'The anonymous Gemini Web bridge does not support image or file input.',
-            { param: 'contents.parts' }
-        );
+    if (part.inlineData || part.inline_data) {
+        const data = part.inlineData || part.inline_data;
+        if (!isObject(data) || typeof data.data !== 'string') {
+            throw new GeminiApiError(400, 'inlineData must contain a base64 data field.', {
+                param: 'contents.parts.inlineData',
+            });
+        }
+        return {
+            text: '[Media attached]',
+            media: {
+                data: `data:${data.mimeType || data.mime_type || 'application/octet-stream'};base64,${data.data}`,
+                mimeType: data.mimeType || data.mime_type || 'application/octet-stream',
+            },
+        };
+    }
+
+    if (part.fileData || part.file_data) {
+        const data = part.fileData || part.file_data;
+        const fileUri = data?.fileUri || data?.file_uri;
+        if (!isObject(data) || typeof fileUri !== 'string' || !fileUri) {
+            throw new GeminiApiError(400, 'fileData must contain a fileUri field.', {
+                param: 'contents.parts.fileData',
+            });
+        }
+        return {
+            text: '[Media attached]',
+            media: {
+                uri: fileUri,
+                mimeType: data.mimeType || data.mime_type || 'application/octet-stream',
+            },
+        };
     }
 
     if (part.functionCall || part.function_call) {
@@ -196,7 +222,10 @@ function readTextPart(part) {
             });
         }
         const id = typeof call.id === 'string' && call.id ? ` id="${call.id}"` : '';
-        return `<function_call_result name="${call.name}"${id}>${JSON.stringify(call.args || {})}</function_call_result>`;
+        return {
+            text: `<function_call_result name="${call.name}"${id}>${JSON.stringify(call.args || {})}</function_call_result>`,
+            media: null,
+        };
     }
 
     if (part.functionResponse || part.function_response) {
@@ -208,17 +237,20 @@ function readTextPart(part) {
         }
         const id =
             typeof response.id === 'string' && response.id ? ` (call id: ${response.id})` : '';
-        return `Tool response for ${response.name}${id}: ${JSON.stringify(response.response ?? {})}`;
+        return {
+            text: `Tool response for ${response.name}${id}: ${JSON.stringify(response.response ?? {})}`,
+            media: null,
+        };
     }
 
     if (part.executableCode || part.executable_code) {
         const executable = part.executableCode || part.executable_code;
-        return `Executable code result: ${JSON.stringify(executable)}`;
+        return { text: `Executable code result: ${JSON.stringify(executable)}`, media: null };
     }
 
     if (part.codeExecutionResult || part.code_execution_result) {
         const result = part.codeExecutionResult || part.code_execution_result;
-        return `Code execution result: ${JSON.stringify(result)}`;
+        return { text: `Code execution result: ${JSON.stringify(result)}`, media: null };
     }
 
     throw new GeminiApiError(400, 'Each content part must contain text.', {
@@ -230,10 +262,15 @@ function readParts(parts, param = 'contents.parts') {
     if (!Array.isArray(parts) || parts.length === 0) {
         throw new GeminiApiError(400, 'Each content must contain at least one part.', { param });
     }
-    return parts
-        .map((part) => readTextPart(part))
-        .filter((text) => text.length > 0)
-        .join('\n');
+    const parsedParts = parts.map((part) => readTextPart(part));
+    const media = parsedParts.map((part) => part.media).filter(Boolean);
+    return {
+        text: parsedParts
+            .map((part) => part.text)
+            .filter((text) => text.length > 0)
+            .join('\n'),
+        media,
+    };
 }
 
 function normalizeContent(content, index) {
@@ -248,8 +285,8 @@ function normalizeContent(content, index) {
             param: `contents[${index}].role`,
         });
     }
-    const text = readParts(content.parts, `contents[${index}].parts`);
-    return { role: role === 'assistant' ? 'model' : role, text };
+    const parsed = readParts(content.parts, `contents[${index}].parts`);
+    return { role: role === 'assistant' ? 'model' : role, text: parsed.text, media: parsed.media };
 }
 
 function readSystemInstruction(systemInstruction) {
@@ -260,7 +297,7 @@ function readSystemInstruction(systemInstruction) {
             param: 'systemInstruction',
         });
     }
-    return readParts(systemInstruction.parts, 'systemInstruction.parts').trim();
+    return readParts(systemInstruction.parts, 'systemInstruction.parts').text.trim();
 }
 
 function getFunctionDeclarations(tools) {
@@ -388,6 +425,7 @@ function buildPrompt(request) {
     const declarations = getFunctionDeclarations(request.tools);
     const toolMode = readToolMode(request.toolConfig || request.tool_config);
     const sections = [];
+    const media = contents.flatMap((content) => content.media || []);
 
     if (system) sections.push(`System instruction:\n${system}`);
 
@@ -410,6 +448,7 @@ function buildPrompt(request) {
         declarations,
         toolMode,
         contents,
+        media,
     };
 }
 
@@ -458,7 +497,7 @@ function parseFunctionCalls(text, declarations, toolMode) {
     }
     if (calls.length > 0) return calls;
 
-    const fencedPattern = /```(?:json)?\s*([\s\S]*?)```/gi;
+    const fencedPattern = /```(?:json|function_call|tool_call)?\s*([\s\S]*?)```/gi;
     while ((match = fencedPattern.exec(source)) !== null) {
         const call = normalizeFunctionCall(
             parseJsonObject(match[1].trim()),
@@ -468,6 +507,17 @@ function parseFunctionCalls(text, declarations, toolMode) {
         if (call) calls.push(call);
     }
     if (calls.length > 0 && source.replace(fencedPattern, '').trim() === '') return calls;
+
+    const looseFunctionCallPattern = /(?:^|\n)function_call\s*\n(\{[^`]*?\})/gi;
+    while ((match = looseFunctionCallPattern.exec(source)) !== null) {
+        const call = normalizeFunctionCall(
+            parseJsonObject(match[1].trim()),
+            declarations,
+            toolMode
+        );
+        if (call) calls.push(call);
+    }
+    if (calls.length > 0) return calls;
 
     const rawCall = normalizeFunctionCall(parseJsonObject(source), declarations, toolMode);
     return rawCall ? [rawCall] : null;
@@ -526,10 +576,10 @@ function normalizeProviderResult(result) {
     return { text: typeof result.text === 'string' ? result.text : '', ...result };
 }
 
-async function callProvider({ prompt, model, signal, onUpdate, sendMessage }) {
+async function callProvider({ prompt, model, signal, onUpdate, fileRefs, sendMessage }) {
     let result;
     try {
-        result = await sendMessage(prompt, model, [], signal, onUpdate);
+        result = await sendMessage(prompt, model, [], signal, onUpdate, { fileRefs });
     } catch (error) {
         if (error?.name === 'AbortError' || signal?.aborted) throw error;
         throw new GeminiApiError(502, `Gemini upstream request failed: ${getErrorMessage(error)}`, {
@@ -606,12 +656,23 @@ async function handleGenerate(request, response, options, model, method) {
     const context = buildPrompt(body);
     const targetModel = getRequestModel(model);
     const stream = method === 'streamGenerateContent';
+    let fileRefs = [];
+    if (context.media.length > 0) {
+        try {
+            fileRefs = await options.uploadMediaParts(context.media, request.signal);
+        } catch (error) {
+            throw new GeminiApiError(502, `Gemini media upload failed: ${getErrorMessage(error)}`, {
+                statusText: 'BAD_GATEWAY',
+            });
+        }
+    }
 
     if (!stream) {
         const result = await callProvider({
             prompt: context.prompt,
             model: targetModel,
             signal: request.signal,
+            fileRefs,
             sendMessage: options.sendMessage,
         });
         writeJson(
@@ -645,6 +706,7 @@ async function handleGenerate(request, response, options, model, method) {
             prompt: context.prompt,
             model: targetModel,
             signal: controller.signal,
+            fileRefs,
             sendMessage: options.sendMessage,
             onUpdate: shouldBufferForTools
                 ? undefined
@@ -791,11 +853,15 @@ export function createGemini2ApiServer(options = {}) {
     const resolvedOptions = {
         maxBodyBytes: DEFAULT_MAX_BODY_BYTES,
         sendMessage: sendNoAuthGeminiMessage,
+        uploadMediaParts,
         ...options,
     };
 
     if (typeof resolvedOptions.sendMessage !== 'function') {
         throw new TypeError('sendMessage must be a function.');
+    }
+    if (typeof resolvedOptions.uploadMediaParts !== 'function') {
+        throw new TypeError('uploadMediaParts must be a function.');
     }
 
     return createServer(async (request, response) => {

@@ -93,6 +93,29 @@ describe('Gemini 2API server', () => {
         ]);
     });
 
+    it('accepts the fenced function_call format used by Gemini Web bridges', async () => {
+        sendMessage = async () => ({
+            text: '```function_call\n{"name":"get_weather","args":{"city":"Shanghai"}}\n```',
+        });
+        await stopServer();
+        await startServer();
+
+        const response = await fetch(`${baseUrl}/v1beta/models/gemini-3.8-flash:generateContent`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                contents: [{ role: 'user', parts: [{ text: 'What is the weather?' }] }],
+                tools: [{ functionDeclarations: [{ name: 'get_weather', parameters: {} }] }],
+            }),
+        });
+        const body = await response.json();
+
+        assert.equal(response.status, 200);
+        assert.deepEqual(body.candidates[0].content.parts, [
+            { functionCall: { name: 'get_weather', args: { city: 'Shanghai' } } },
+        ]);
+    });
+
     it('streams Gemini SSE without an OpenAI DONE sentinel', async () => {
         sendMessage = async (prompt, model, files, signal, onUpdate) => {
             onUpdate('Hello');
@@ -123,5 +146,45 @@ describe('Gemini 2API server', () => {
         assert.equal(events[1].candidates[0].content.parts[0].text, ' world');
         assert.equal(events.at(-1).candidates[0].finishReason, 'STOP');
         assert.ok(!text.includes('data: [DONE]'));
+    });
+
+    it('uploads inlineData before sending the StreamGenerate request', async () => {
+        let uploadedParts = [];
+        let providerOptions;
+        sendMessage = async (prompt, model, files, signal, onUpdate, options) => {
+            providerOptions = options;
+            return { text: 'The image is a pixel.' };
+        };
+        await stopServer();
+        server = createGemini2ApiServer({
+            sendMessage,
+            uploadMediaParts: async (parts) => {
+                uploadedParts = parts;
+                return ['/contrib_service/ttl_1d/test-image'];
+            },
+        });
+        await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+        baseUrl = `http://127.0.0.1:${server.address().port}`;
+
+        const response = await fetch(`${baseUrl}/v1beta/models/gemini-3.8-flash:generateContent`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                contents: [
+                    {
+                        role: 'user',
+                        parts: [
+                            { text: 'What is in this image?' },
+                            { inlineData: { mimeType: 'image/png', data: 'AQ==' } },
+                        ],
+                    },
+                ],
+            }),
+        });
+
+        assert.equal(response.status, 200);
+        assert.equal(uploadedParts.length, 1);
+        assert.equal(uploadedParts[0].mimeType, 'image/png');
+        assert.deepEqual(providerOptions.fileRefs, ['/contrib_service/ttl_1d/test-image']);
     });
 });

@@ -9,4 +9,4 @@ ENV GEMINI_2API_PORT=8787
 
 EXPOSE 8787
 
-CMD ["node", "src/index.js"]
+CMD ["node", "--max-http-header-size=131072", "src/index.js"]
