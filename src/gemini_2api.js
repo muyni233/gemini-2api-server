@@ -634,7 +634,7 @@ async function callProvider({ prompt, model, signal, onUpdate, sendMessage }) {
     return normalized;
 }
 
-async function readRequestBody(request, maxBodyBytes) {
+async function readRequestBody(request, maxBodyBytes, signal) {
     const encoding = request.headers['content-encoding'];
     if (encoding && encoding !== 'identity')
         throw new GeminiApiError(400, 'Compressed request bodies are not supported.');
@@ -649,7 +649,7 @@ async function readRequestBody(request, maxBodyBytes) {
             request.off('data', data);
             request.off('end', end);
             request.off('error', fail);
-            request.signal.removeEventListener('abort', abort);
+            signal.removeEventListener('abort', abort);
         };
         const fail = (error) => {
             cleanup();
@@ -657,7 +657,7 @@ async function readRequestBody(request, maxBodyBytes) {
             request.resume();
             reject(error);
         };
-        const abort = () => fail(request.signal.reason);
+        const abort = () => fail(signal.reason);
         const data = (chunk) => {
             size += chunk.length;
             if (size > maxBodyBytes) {
@@ -683,8 +683,8 @@ async function readRequestBody(request, maxBodyBytes) {
         request.on('data', data);
         request.once('end', end);
         request.once('error', fail);
-        request.signal.addEventListener('abort', abort, { once: true });
-        if (request.signal.aborted) abort();
+        signal.addEventListener('abort', abort, { once: true });
+        if (signal.aborted) abort();
     });
 }
 
@@ -718,7 +718,7 @@ function requireContents(body) {
 async function handleGenerate(request, response, options, model, method) {
     const adjustments = [];
     const requestedModel = getRequestModel(model, adjustments);
-    const body = await readRequestBody(request, options.maxBodyBytes);
+    const body = await readRequestBody(request, options.maxBodyBytes, options.signal);
     requireContents(body);
     const context = buildPrompt(body, adjustments);
     const targetModel = applyThinking(requestedModel, context.thinking, adjustments);
@@ -726,10 +726,10 @@ async function handleGenerate(request, response, options, model, method) {
     if (options.state.active >= options.maxConcurrentRequests) {
         throw new GeminiApiError(429, 'Too many active generation requests.', { retryAfter: '1' });
     }
-    request.signal.throwIfAborted();
+    options.signal.throwIfAborted();
     options.state.active++;
     const deadline = createDeadline(
-        request.signal,
+        options.signal,
         options.requestTimeoutMs,
         new GeminiApiError(504, 'Generation request timed out.')
     );
@@ -810,7 +810,7 @@ async function handleGenerate(request, response, options, model, method) {
             endSse(response);
         } catch (error) {
             await writer.flush().catch(() => {});
-            if (!request.signal.aborted && !response.destroyed && !response.writableEnded) {
+            if (!options.signal.aborted && !response.destroyed && !response.writableEnded) {
                 response.write('data: ' + JSON.stringify(createErrorBody(error)) + '\n\n');
             }
             endSse(response);
@@ -825,7 +825,7 @@ async function handleGenerate(request, response, options, model, method) {
 async function handleCountTokens(request, response, options, model) {
     const adjustments = [];
     const targetModel = getRequestModel(model, adjustments);
-    const body = await readRequestBody(request, options.maxBodyBytes);
+    const body = await readRequestBody(request, options.maxBodyBytes, options.signal);
     let input = body;
     const nested = body.generateContentRequest ?? body.generate_content_request;
     if (nested !== undefined) {
@@ -983,7 +983,6 @@ export function createGemini2ApiServer(options = {}) {
         async (request, response) => {
             const controller = new AbortController();
             controllers.add(controller);
-            request.signal = controller.signal;
             const abort = () =>
                 controller.abort(new DOMException('Client disconnected', 'AbortError'));
             const close = () => {
@@ -996,7 +995,11 @@ export function createGemini2ApiServer(options = {}) {
             try {
                 setCorsHeaders(request, response, resolvedOptions);
                 if (stopping) throw new GeminiApiError(503, 'Server is shutting down.');
-                await routeRequest(request, response, resolvedOptions);
+                // IncomingMessage.signal is read-only on newer Node releases.
+                await routeRequest(request, response, {
+                    ...resolvedOptions,
+                    signal: controller.signal,
+                });
             } catch (error) {
                 if (controller.signal.aborted || response.writableEnded || response.destroyed)
                     return;
