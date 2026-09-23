@@ -47,12 +47,6 @@ function parseLine(line) {
             events.push({ error: rpcError(code) });
             continue;
         }
-        const metadata = JSON.stringify(row.slice(3));
-        const bardError = metadata.match(/BardErrorInfo[^\d]{0,32}\[(\d+)\]/);
-        if (bardError) {
-            events.push({ error: rpcError(Number(bardError[1])) });
-            continue;
-        }
         if (row[0] !== 'wrb.fr' || row[2] == null || row[2] === '') continue;
         let inner;
         try {

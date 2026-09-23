@@ -132,10 +132,6 @@ describe('HTTP boundaries and compatibility', () => {
                 for (const suffix of ['@anything', '@think=4junk', '@think=5', '@think=-1']) {
                     const response = await post(INPUT, method, MODEL + suffix);
                     assert.equal(response.status, 200);
-                    assert.match(
-                        response.headers.get('x-gemini-adjusted-parameters'),
-                        /model\.%40think/
-                    );
                     await response.text();
                 }
                 const unknown = await post(INPUT, method, 'constructor');
@@ -178,17 +174,12 @@ describe('HTTP boundaries and compatibility', () => {
                     'countTokens'
                 );
                 assert.equal(conflicting.status, 200);
-                assert.match(conflicting.headers.get('x-gemini-adjusted-parameters'), /contents/);
                 await conflicting.text();
                 const mismatch = await post(
                     { generateContentRequest: { ...INPUT, model: 'gemini-auto' } },
                     'countTokens'
                 );
                 assert.equal(mismatch.status, 200);
-                assert.match(
-                    mismatch.headers.get('x-gemini-adjusted-parameters'),
-                    /generateContentRequest.model/
-                );
                 await mismatch.text();
             }
         );
@@ -219,7 +210,7 @@ describe('HTTP boundaries and compatibility', () => {
         );
     });
 
-    it('ignores unsupported optional controls and reports adjustments', async () => {
+    it('ignores unsupported optional controls', async () => {
         await withServer({}, async ({ post }) => {
             for (const config of [
                 {
@@ -241,7 +232,6 @@ describe('HTTP boundaries and compatibility', () => {
             ]) {
                 const response = await post({ ...INPUT, ...config });
                 assert.equal(response.status, 200, JSON.stringify(config));
-                assert.ok(response.headers.get('x-gemini-adjusted-parameters'));
                 assert.equal((await response.json()).candidates[0].content.parts[0].text, 'OK');
             }
         });
@@ -263,7 +253,6 @@ describe('HTTP boundaries and compatibility', () => {
                     toolConfig: { functionCallingConfig: config },
                 });
                 assert.equal(response.status, 200);
-                assert.ok(response.headers.get('x-gemini-adjusted-parameters'));
                 assert.deepEqual((await response.json()).candidates[0].content.parts, [{ text }]);
             }
             const partial = await post({
@@ -305,27 +294,10 @@ describe('HTTP boundaries and compatibility', () => {
                 },
             });
             assert.equal(response.status, 200);
-            assert.ok(response.headers.get('x-gemini-adjusted-parameters'));
             assert.equal(
                 (await response.json()).candidates[0].content.parts[0].functionCall.name,
                 'weather'
             );
-        });
-    });
-
-    it('bounds and escapes adjustment headers for arbitrary input field names', async () => {
-        const config = Object.fromEntries(
-            Array.from({ length: 30 }, (_, index) => ['\r\n\ud800\u4e2d'.repeat(100) + index, true])
-        );
-        await withServer({}, async ({ post }) => {
-            const response = await post({ ...INPUT, generationConfig: config });
-            assert.equal(response.status, 200);
-            const header = response.headers.get('x-gemini-adjusted-parameters');
-            assert.ok(header.length < 1900);
-            assert.ok(!/[\r\n]/.test(header));
-            for (const item of header.split(', '))
-                assert.doesNotThrow(() => decodeURIComponent(item));
-            await response.text();
         });
     });
 
@@ -479,12 +451,17 @@ describe('HTTP boundaries and compatibility', () => {
         }
     });
 
-    it('ends a revised or truncated SSE response with an error and never STOP', async () => {
-        for (const result of [{ text: 'Goodbye' }, { text: 'Hello', truncated: true }]) {
+    it('ends revised or failed SSE responses with an error and never STOP', async () => {
+        for (const result of [
+            { text: 'Goodbye' },
+            { text: 'Hello', truncated: true },
+            new UpstreamError('Stream interrupted.'),
+        ]) {
             await withServer(
                 {
                     sendMessage: async (_p, _m, _f, _s, update) => {
                         update('Hello');
+                        if (result instanceof Error) throw result;
                         return result;
                     },
                 },

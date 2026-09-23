@@ -153,7 +153,6 @@ describe('request reasoning effort', () => {
             for (const [config, model, expected] of conflicting) {
                 const response = await post({ ...INPUT, ...config }, 'generateContent', model);
                 assert.equal(response.status, 200);
-                assert.ok(response.headers.get('x-gemini-adjusted-parameters'));
                 assert.equal(response.headers.get('x-gemini-thinking-mode'), String(expected));
                 await response.text();
                 assert.equal(models.at(-1), MODEL + '@think=' + expected);
@@ -178,7 +177,6 @@ describe('request reasoning effort', () => {
             ]) {
                 const response = await post({ ...INPUT, ...config });
                 assert.equal(response.status, 200, JSON.stringify(config));
-                assert.ok(response.headers.get('x-gemini-adjusted-parameters'));
                 await response.text();
                 assert.equal(models.at(-1), MODEL);
             }
@@ -221,7 +219,6 @@ describe('request reasoning effort', () => {
             });
             assert.equal(response.status, 200);
             assert.equal(response.headers.get('x-gemini-thinking-mode'), '0');
-            assert.match(response.headers.get('x-gemini-adjusted-parameters'), /reasoning_effort/);
             await response.text();
             assert.equal(models.at(-1), MODEL + '@think=0');
         });

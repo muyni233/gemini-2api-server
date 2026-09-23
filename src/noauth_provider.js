@@ -87,6 +87,12 @@ async function cancelBody(body) {
     }
 }
 
+async function closeReader(reader) {
+    if (!reader) return;
+    await cancelBody(reader);
+    reader.releaseLock();
+}
+
 export function createNoAuthGeminiProvider({
     fetchImpl = (...args) => fetch(...args),
     now = Date.now,
@@ -153,14 +159,7 @@ export function createNoAuthGeminiProvider({
             if (process.env.GEMINI_2API_DEBUG === '1')
                 console.debug('[Gemini] Build label refresh failed:', error.message);
         } finally {
-            if (reader) {
-                try {
-                    await reader.cancel();
-                } catch {
-                    /* Already aborted. */
-                }
-                reader.releaseLock();
-            }
+            await closeReader(reader);
             deadline.dispose();
             revision++;
             expiresAt = now() + (found ? buildLabelTtlMs : buildLabelFailureTtlMs);
@@ -205,6 +204,13 @@ export function createNoAuthGeminiProvider({
                 let completion;
                 let bytes = 0;
                 const parser = new RpcStreamDecoder(maxFrameChars);
+                const emit = async (text) => {
+                    if (!onUpdate || text === emittedText) return;
+                    if (!text.startsWith(emittedText))
+                        throw new UpstreamError('Gemini revised text that was already streamed.');
+                    await withAbort(onUpdate(text), signal);
+                    emittedText = text;
+                };
                 try {
                     const response = await fetchImpl(endpoint(build.bl), {
                         method: 'POST',
@@ -245,30 +251,19 @@ export function createNoAuthGeminiProvider({
                             );
                         for (const event of parser.push(value, done)) {
                             if (event.error) throw event.error;
-                            const candidates = event.candidates.filter(
-                                (candidate) =>
-                                    Array.isArray(candidate) &&
-                                    Array.isArray(candidate[1]) &&
-                                    typeof candidate[1][0] === 'string' &&
-                                    (candidate[0] == null || typeof candidate[0] === 'string')
+                            const candidate = event.candidates.find(
+                                (part) =>
+                                    Array.isArray(part) &&
+                                    Array.isArray(part[1]) &&
+                                    typeof part[1][0] === 'string' &&
+                                    (part[0] == null || typeof part[0] === 'string') &&
+                                    (selectedId === undefined || (part[0] ?? null) === selectedId)
                             );
-                            const candidate =
-                                selectedId === undefined
-                                    ? candidates.find((c) => typeof c?.[1]?.[0] === 'string')
-                                    : candidates.find((c) => (c?.[0] ?? null) === selectedId);
-                            if (!candidate || typeof candidate[1]?.[0] !== 'string') continue;
+                            if (!candidate) continue;
                             if (selectedId === undefined) selectedId = candidate[0] ?? null;
                             rawText = candidate[1][0];
                             if ([1, 2].includes(candidate[8]?.[0])) completion = candidate[8][0];
-                            const next = cleanSnapshot(rawText);
-                            if (onUpdate && next !== emittedText) {
-                                if (!next.startsWith(emittedText))
-                                    throw new UpstreamError(
-                                        'Gemini revised text that was already streamed.'
-                                    );
-                                await withAbort(onUpdate(next), signal);
-                                emittedText = next;
-                            }
+                            if (onUpdate) await emit(cleanSnapshot(rawText));
                         }
                         if (done) break;
                     }
@@ -281,34 +276,19 @@ export function createNoAuthGeminiProvider({
                         throw new UpstreamError(
                             'Gemini returned no text candidate (possible protocol, access, or media-only response).'
                         );
-                    if (onUpdate && text !== emittedText) {
-                        if (!text.startsWith(emittedText))
-                            throw new UpstreamError(
-                                'Gemini final text differs from the streamed response.'
-                            );
-                        await withAbort(onUpdate(text), signal);
-                    }
+                    await emit(text);
                     return { text };
                 } catch (error) {
                     if (signal.aborted) throw signal.reason;
                     // A new generation must never be appended after output from a failed one.
                     if (attempt === 0 && !rawText && error.refreshBuild === true) continue;
-                    if (rawText)
-                        return { text: cleanSnapshot(rawText, true), truncated: true, error };
                     throw error instanceof UpstreamError
                         ? error
                         : new UpstreamError(
                               `Failed to read Gemini upstream: ${error.message || error}`
                           );
                 } finally {
-                    if (reader) {
-                        try {
-                            await reader.cancel();
-                        } catch {
-                            /* Already closed or aborted. */
-                        }
-                        reader.releaseLock();
-                    }
+                    await closeReader(reader);
                 }
             }
             throw new UpstreamError('Gemini upstream retry exhausted.');

@@ -183,17 +183,17 @@ describe('anonymous upstream protocol', () => {
             () => new Response(frame(row(candidate('Partial')), errorRow(1052)))
         );
         const updates = [];
-        const result = await invoke(send, (text) => updates.push(text));
-        assert.equal(result.truncated, true);
+        await assert.rejects(
+            invoke(send, (text) => updates.push(text)),
+            (error) => error.code === 1052
+        );
         assert.equal(requests.length, 1);
         assert.deepEqual(updates, ['Partial']);
     });
 
     it('detects clean EOF before a reported completion marker', async () => {
         const { send } = fixture(() => new Response(frame(row(candidate('Partial', 'answer', 1)))));
-        const result = await invoke(send);
-        assert.equal(result.truncated, true);
-        assert.match(result.error.message, /completion marker/);
+        await assert.rejects(invoke(send), /completion marker/);
     });
 
     it('rejects trailing invalid JSON and invalid UTF-8', async () => {
@@ -207,9 +207,10 @@ describe('anonymous upstream protocol', () => {
         const { send } = fixture(
             () => new Response(frame(row(candidate('Hello'))) + frame(row(candidate('Goodbye'))))
         );
-        const result = await invoke(send, () => {});
-        assert.equal(result.truncated, true);
-        assert.match(result.error.message, /revised/);
+        await assert.rejects(
+            invoke(send, () => {}),
+            /revised/
+        );
         assert.equal((await invoke(send)).text, 'Goodbye');
     });
 

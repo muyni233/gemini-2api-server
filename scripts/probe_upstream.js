@@ -33,25 +33,22 @@ try {
         updates++;
         firstUpdateMs ??= Math.round(performance.now() - started);
     });
-    const ok = !result.truncated && !!result.text?.trim();
     console.log(
         JSON.stringify(
             {
-                ok,
+                ok: true,
                 requestedAlias: model,
                 backendModelVerified: false,
                 elapsedMs: Math.round(performance.now() - started),
                 firstUpdateMs,
                 updates,
                 responseCharacters: result.text.length,
-                ...(result.error ? { error: result.error.message } : {}),
                 requests,
             },
             null,
             2
         )
     );
-    if (!ok) process.exitCode = 1;
 } catch (error) {
     console.log(
         JSON.stringify(
@@ -68,4 +65,6 @@ try {
         )
     );
     process.exitCode = 1;
+} finally {
+    provider.close();
 }

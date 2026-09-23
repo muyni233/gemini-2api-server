@@ -144,13 +144,13 @@ Gemini 原生 `thinkingLevel` 使用单独的映射，`HIGH` 对应最深的 `0`
 
 上表是本项目约定的相对档位映射，不承诺跨模型等效预算；`none` 映射到最浅档，不保证完全关闭思考。取值为空、非法或不认识时尝试下一个有效配置；`null`、`auto`、`default` 和原生 `THINKING_LEVEL_UNSPECIFIED` 表示不覆盖默认。优先级为：`reasoning_effort` → `reasoningEffort` → `reasoning.effort` → 原生 `thinkingLevel` → URL `@think=` → 模型默认值。原生参数同层优先 camelCase，再尝试 snake_case，优先级不受 JSON 属性顺序影响。冲突时采用优先级较高的有效值，继续处理请求。`countTokens` 使用相同归一化规则，思考档位不改变本地提示词计数。
 
-响应头 `X-Gemini-Thinking-Mode` 给出归一化后的档位；`X-Gemini-Adjusted-Parameters` 列出被忽略、回退或覆盖的字段（字段路径经 URL 编码，逗号分隔，长度受限）。JSON 和 SSE 响应都提供这些诊断信息。
+JSON 和 SSE 响应的 `X-Gemini-Thinking-Mode` 响应头给出归一化后的思考档位。
 
 - 仅支持文本；`inlineData`、`fileData` 和混合数据 Part 会在请求上游前被拒绝。
 - 系统提示词和多轮历史被折叠成单次文本请求，不具备原生角色隔离、缓存和会话连续性。
 - `tools[].functionDeclarations`、`functionCall` 和 `functionResponse` 使用提示词桥接。支持 AUTO、ANY、NONE 和函数名称限制；有效 ANY 配置未得到有效调用时返回 502。畸形声明会被丢弃，重复名称保留第一个有效声明；错误的工具模式或完全无效的白名单会停用工具，保留普通文字回答，避免意外允许所有函数。函数由客户端执行，执行前仍须校验参数及操作权限。这里不提供原生约束解码或完整 JSON Schema 校验。
 - 工具调用请求先缓冲完整输出再生成 functionCall，避免把半个 JSON 发给客户端。正文中带解释的调用示例不会转换成函数执行请求。
-- `generationConfig` 支持上述 `thinkingConfig.thinkingLevel` 映射，以及不改变行为的 `candidateCount: 1`、`responseMimeType: "text/plain"`、`thinkingConfig.includeThoughts: false`。温度、输出上限、stop、JSON Schema、精确 `thinkingBudget`、思考摘要输出、多模态输出等不能可靠透传，会忽略并标注调整字段。非空 safetySettings、cachedContent、Google Search/codeExecution 等内置工具配置也采用此策略；成功响应不代表这些约束已生效，Web 自发搜索也不等同于 API 的可配置 grounding。
+- `generationConfig` 仅映射上述 `thinkingConfig.thinkingLevel`，其余字段忽略；输出保持单个文本候选，不提供思考摘要。温度、输出上限、stop、JSON Schema、精确 `thinkingBudget`、多模态输出等不能可靠透传。safetySettings、cachedContent、Google Search/codeExecution 等内置工具配置也会被忽略；成功响应不代表这些约束已生效，Web 自发搜索也不等同于 API 的可配置 grounding。
 - `countTokens` 支持 `contents` 或 `generateContentRequest`，同时提供时优先有效的嵌套对象；冗余模型字段以 URL 为准。它及 `usageMetadata` 使用本地 Unicode 字符数除以 4 的粗估，包括桥接提示词；中文、代码等误差可能很大，不能用于计费或精确预算。响应头 `X-Gemini-Token-Count: estimated` 标注此限制。
 
 ## 运行边界与错误
@@ -182,4 +182,4 @@ npm run probe:upstream -- gemini-3.5-flash-thinking@think=2
 
 测试完全离线。探测命令会向 Google 发出一条固定短提示词，输出构建号、耗时、更新数和错误分类，不输出原始 RPC 或敏感会话数据；默认上限 45 秒。探测成功只证明该别名当前能返回文本，不能证明后端型号。
 
-模块调用可通过 `createGemini2ApiServer({ sendMessage, maxBodyBytes, requestTimeoutMs, maxConcurrentRequests, maxPendingSseBytes, apiKey, allowedOrigins })` 配置。关闭时使用 `await server.shutdown({ gracePeriodMs: 10000 })`。自定义 provider 应响应传入的 AbortSignal，并等待 `onUpdate(text)` 返回的 Promise。
+模块调用可通过 `createGemini2ApiServer({ sendMessage, maxBodyBytes, requestTimeoutMs, maxConcurrentRequests, maxPendingSseBytes, apiKey, allowedOrigins })` 配置。关闭时使用 `await server.shutdown({ gracePeriodMs: 10000 })`。自定义 provider 成功时返回文本或 `{ text }`，失败时抛出异常；应响应传入的 AbortSignal，并等待 `onUpdate(text)` 返回的 Promise（`text` 为累计文本）。

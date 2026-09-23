@@ -1,8 +1,9 @@
 import { createServer } from 'node:http';
+import { once } from 'node:events';
 import { createHash, timingSafeEqual } from 'node:crypto';
 import { createDeadline, positiveInteger, withAbort } from './async_utils.js';
 import { createSseWriter } from './sse.js';
-import { normalizeRequestOptions, recordAdjustment } from './request_options.js';
+import { normalizeRequestOptions } from './request_options.js';
 import {
     DEFAULT_NOAUTH_MODEL,
     NOAUTH_MODEL_NAMES,
@@ -31,50 +32,35 @@ export class GeminiApiError extends Error {
         super(message);
         this.name = 'GeminiApiError';
         this.status = status;
-        this.statusText = options.statusText || statusToStatusText(status);
-        this.code = options.code || this.statusText;
+        this.statusText = options.statusText;
         this.param = options.param;
         this.retryAfter = options.retryAfter;
     }
 }
 
-function statusToStatusText(status) {
-    if (status === 400) return 'INVALID_ARGUMENT';
-    if (status === 401) return 'UNAUTHENTICATED';
-    if (status === 403) return 'PERMISSION_DENIED';
-    if (status === 404) return 'NOT_FOUND';
-    if (status === 413) return 'RESOURCE_EXHAUSTED';
-    if (status === 429) return 'RESOURCE_EXHAUSTED';
-    if (status === 499) return 'CANCELLED';
-    if (status === 502) return 'BAD_GATEWAY';
-    if (status === 503) return 'UNAVAILABLE';
-    if (status === 504) return 'DEADLINE_EXCEEDED';
-    return 'INTERNAL';
-}
-
-function getErrorStatus(error) {
-    return Number.isInteger(error?.status) && error.status >= 400 && error.status <= 599
-        ? error.status
-        : 500;
-}
-
-function getErrorMessage(error) {
-    if (error instanceof GeminiApiError) return error.message;
-    return error?.message ? String(error.message) : 'Internal server error.';
-}
-
-function getErrorStatusText(error) {
-    return error instanceof GeminiApiError
-        ? error.statusText
-        : statusToStatusText(getErrorStatus(error));
-}
+const ERROR_STATUSES = {
+    400: 'INVALID_ARGUMENT',
+    401: 'UNAUTHENTICATED',
+    403: 'PERMISSION_DENIED',
+    404: 'NOT_FOUND',
+    413: 'RESOURCE_EXHAUSTED',
+    429: 'RESOURCE_EXHAUSTED',
+    499: 'CANCELLED',
+    502: 'BAD_GATEWAY',
+    503: 'UNAVAILABLE',
+    504: 'DEADLINE_EXCEEDED',
+};
 
 function createErrorBody(error) {
+    const code =
+        Number.isInteger(error?.status) && error.status >= 400 && error.status <= 599
+            ? error.status
+            : 500;
     return {
         error: {
-            code: getErrorStatus(error),
-            message: getErrorMessage(error),
-            status: getErrorStatusText(error),
+            code,
+            message: error?.message || 'Internal server error.',
+            status: error?.statusText || ERROR_STATUSES[code] || 'INTERNAL',
             ...(error?.param
                 ? {
                       details: [
@@ -121,7 +107,7 @@ function setCorsHeaders(request, response, options) {
     response.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
     response.setHeader(
         'Access-Control-Expose-Headers',
-        'Content-Type, Retry-After, X-Gemini-Token-Count, X-Gemini-Thinking-Mode, X-Gemini-Adjusted-Parameters'
+        'Content-Type, Retry-After, X-Gemini-Token-Count, X-Gemini-Thinking-Mode'
     );
 }
 
@@ -138,8 +124,9 @@ function writeError(response, error) {
     if (error?.retryAfter && /^[\w ,:\-]+$/.test(String(error.retryAfter))) {
         response.setHeader('Retry-After', String(error.retryAfter).slice(0, 128));
     }
-    if (getErrorStatus(error) === 413) response.setHeader('Connection', 'close');
-    writeJson(response, getErrorStatus(error), createErrorBody(error));
+    const body = createErrorBody(error);
+    if (body.error.code === 413) response.setHeader('Connection', 'close');
+    writeJson(response, body.error.code, body);
 }
 
 function endSse(response) {
@@ -167,7 +154,7 @@ function parseModelPath(pathname) {
     if (API_VERSION_PREFIXES.has(parts[0])) parts.shift();
 
     if (parts[0] !== 'models' || !parts[1] || parts.length !== 2) return null;
-    const modelAndMethod = parts.slice(1).join('/');
+    const modelAndMethod = parts[1];
     const methodIndex = modelAndMethod.lastIndexOf(':');
     if (methodIndex === -1) {
         return { model: decodePathPart(modelAndMethod), method: null };
@@ -177,12 +164,6 @@ function parseModelPath(pathname) {
         model: decodePathPart(modelAndMethod.slice(0, methodIndex)),
         method: modelAndMethod.slice(methodIndex + 1),
     };
-}
-
-function getModelNames() {
-    return Array.isArray(NOAUTH_MODEL_NAMES) && NOAUTH_MODEL_NAMES.length > 0
-        ? NOAUTH_MODEL_NAMES
-        : [DEFAULT_NOAUTH_MODEL];
 }
 
 function normalizeModelId(model) {
@@ -203,10 +184,6 @@ function modelResource(model) {
             'Anonymous Gemini Web mode alias; backend version is unverified. Pro aliases may fall back to Flash. Token counts are estimates.',
         ...MODEL_DESCRIPTION,
     };
-}
-
-function listModelsResponse() {
-    return { models: getModelNames().map(modelResource) };
 }
 
 function isObject(value) {
@@ -344,14 +321,9 @@ function readSystemInstruction(systemInstruction) {
 }
 
 function formatToolPrompt(declarations, toolMode) {
-    if (declarations.length === 0 || toolMode.mode === 'NONE') return '';
+    if (declarations.length === 0) return '';
 
     const available = declarations
-        .filter(
-            (declaration) =>
-                toolMode.allowedFunctionNames.length === 0 ||
-                toolMode.allowedFunctionNames.includes(declaration.name)
-        )
         .map((declaration) =>
             JSON.stringify({
                 name: declaration.name,
@@ -362,7 +334,7 @@ function formatToolPrompt(declarations, toolMode) {
         .join('\n');
 
     const modeInstruction =
-        toolMode.mode === 'ANY'
+        toolMode === 'ANY'
             ? 'You must call one of the available tools when answering.'
             : 'Call a tool only when it is useful for answering the user.';
 
@@ -384,15 +356,15 @@ function formatConversation(contents) {
         .join('\n\n');
 }
 
-function buildPrompt(request, adjustments = []) {
-    const { thinking, declarations, toolMode } = normalizeRequestOptions(request, adjustments);
-    const contents = request.contents.map(normalizeContent);
-    if (contents.length === 0) {
+function buildPrompt(request) {
+    if (!Array.isArray(request.contents) || request.contents.length === 0) {
         throw new GeminiApiError(400, 'contents must contain at least one item.', {
             param: 'contents',
         });
     }
 
+    const { thinking, declarations, toolMode } = normalizeRequestOptions(request);
+    const contents = request.contents.map(normalizeContent);
     const system = readSystemInstruction(request.systemInstruction ?? request.system_instruction);
     if (!contents.some((content) => content.text.trim())) {
         throw new GeminiApiError(
@@ -422,34 +394,12 @@ function buildPrompt(request, adjustments = []) {
         prompt: sections.join('\n\n'),
         declarations,
         toolMode,
-        contents,
         thinking,
-        adjustments,
     };
 }
 
-function applyThinking(model, thinking, adjustments) {
-    if (!thinking) return model;
-    const config = resolveNoAuthModel(model);
-    if (model.includes('@think=') && config.think !== thinking.mode)
-        recordAdjustment(adjustments, 'model.@think');
-    return config.name + '@think=' + thinking.mode;
-}
-
-function setOptionHeaders(response, adjustments, model) {
-    response.setHeader('X-Gemini-Thinking-Mode', String(resolveNoAuthModel(model).think));
-    const fields = [];
-    let size = 0;
-    for (const field of adjustments) {
-        const encoded = encodeURIComponent(field);
-        if (size + encoded.length > 1800) {
-            fields.push('...');
-            break;
-        }
-        fields.push(encoded);
-        size += encoded.length + 2;
-    }
-    if (fields.length) response.setHeader('X-Gemini-Adjusted-Parameters', fields.join(', '));
+function applyThinking(model, thinking) {
+    return thinking == null ? model : model.split('@')[0] + '@think=' + thinking;
 }
 
 function parseJsonObject(value) {
@@ -461,14 +411,11 @@ function parseJsonObject(value) {
     }
 }
 
-function normalizeFunctionCall(candidate, declarations, toolMode) {
+function normalizeFunctionCall(candidate, declarations) {
     if (!isObject(candidate)) return null;
     const nested = isObject(candidate.function) ? candidate.function : candidate;
     const name = typeof nested.name === 'string' ? nested.name.trim() : '';
     if (!name) return null;
-    if (toolMode.allowedFunctionNames.length > 0 && !toolMode.allowedFunctionNames.includes(name)) {
-        return null;
-    }
     if (!declarations.some((declaration) => declaration.name === name)) return null;
 
     let args = nested.args ?? nested.arguments ?? nested.parameters ?? {};
@@ -481,8 +428,8 @@ function normalizeFunctionCall(candidate, declarations, toolMode) {
     return { ...(typeof nested.id === 'string' && nested.id ? { id: nested.id } : {}), name, args };
 }
 
-function parseFunctionCalls(text, declarations, toolMode) {
-    if (declarations.length === 0 || toolMode.mode === 'NONE') return null;
+function parseFunctionCalls(text, declarations) {
+    if (declarations.length === 0) return null;
     let remaining = String(text || '').trim();
     if (!remaining) return null;
     const calls = [];
@@ -499,8 +446,7 @@ function parseFunctionCalls(text, declarations, toolMode) {
             const contentEnd = open[0].length + close.index;
             const call = normalizeFunctionCall(
                 parseJsonObject(remaining.slice(open[0].length, contentEnd)),
-                declarations,
-                toolMode
+                declarations
             );
             if (!call) return null;
             calls.push(call);
@@ -516,8 +462,7 @@ function parseFunctionCalls(text, declarations, toolMode) {
             if (end === -1) return null;
             const call = normalizeFunctionCall(
                 parseJsonObject(remaining.slice(open[0].length, end)),
-                declarations,
-                toolMode
+                declarations
             );
             if (!call) return null;
             calls.push(call);
@@ -528,15 +473,14 @@ function parseFunctionCalls(text, declarations, toolMode) {
     const looseCall = /^function_call\s*\n([\s\S]+)$/.exec(remaining);
     const call = normalizeFunctionCall(
         parseJsonObject(looseCall ? looseCall[1] : remaining),
-        declarations,
-        toolMode
+        declarations
     );
     return call ? [call] : null;
 }
 
 function toResponseParts(text, toolContext) {
-    const calls = parseFunctionCalls(text, toolContext.declarations, toolContext.toolMode);
-    if (!calls && toolContext.toolMode.mode === 'ANY') {
+    const calls = parseFunctionCalls(text, toolContext.declarations);
+    if (!calls && toolContext.toolMode === 'ANY') {
         throw new GeminiApiError(
             502,
             'Gemini did not return a valid call to an allowed function in ANY mode.'
@@ -544,13 +488,7 @@ function toResponseParts(text, toolContext) {
     }
     if (!calls) return text ? [{ text }] : [];
 
-    return calls.map((call) => ({
-        functionCall: {
-            ...(call.id ? { id: call.id } : {}),
-            name: call.name,
-            args: call.args,
-        },
-    }));
+    return calls.map((functionCall) => ({ functionCall }));
 }
 
 function estimateTokens(text) {
@@ -569,69 +507,34 @@ function createUsageMetadata(prompt, text) {
     };
 }
 
-function createCandidate(parts, options = {}) {
+function createGenerateResponse(text, context, parts = toResponseParts(text, context)) {
     return {
-        content: { role: 'model', parts },
-        finishReason: options.finishReason || 'STOP',
-        index: 0,
-    };
-}
-
-function createGenerateResponse(model, text, toolContext, prompt) {
-    const parts = toResponseParts(text, toolContext);
-    const response = {
-        candidates: [createCandidate(parts)],
+        candidates: [{ content: { role: 'model', parts }, finishReason: 'STOP', index: 0 }],
         modelVersion: MODEL_VERSION,
-        usageMetadata: createUsageMetadata(prompt, text),
+        usageMetadata: createUsageMetadata(context.prompt, text),
     };
-    if (parts.length === 0) response.promptFeedback = { blockReason: 'OTHER' };
-    return response;
-}
-
-function normalizeProviderResult(result) {
-    if (typeof result === 'string') return { text: result };
-    if (!isObject(result)) return { text: '' };
-    return { ...result, text: typeof result.text === 'string' ? result.text : '' };
 }
 
 async function callProvider({ prompt, model, signal, onUpdate, sendMessage }) {
+    signal.throwIfAborted();
     let result;
     try {
-        signal?.throwIfAborted();
-        result = await withAbort(
-            Promise.resolve().then(() => {
-                signal?.throwIfAborted();
-                return sendMessage(prompt, model, [], signal, onUpdate);
-            }),
-            signal
-        );
+        result = await withAbort(sendMessage(prompt, model, [], signal, onUpdate), signal);
     } catch (error) {
-        if (error?.name === 'AbortError' || signal?.aborted) throw error;
-        if (error instanceof GeminiApiError) throw error;
-        throw new GeminiApiError(
-            error instanceof UpstreamError ? error.status : 502,
-            `Gemini upstream request failed: ${getErrorMessage(error)}`,
-            {
-                retryAfter: error instanceof UpstreamError ? error.retryAfter : undefined,
-            }
-        );
-    }
-    const normalized = normalizeProviderResult(result);
-    if (normalized.truncated) {
+        if (signal.aborted) throw signal.reason;
+        if (error instanceof GeminiApiError || error instanceof UpstreamError) throw error;
         throw new GeminiApiError(
             502,
-            'Gemini upstream returned a truncated response. Please retry.',
-            {
-                statusText: 'BAD_GATEWAY',
-            }
+            'Gemini upstream request failed: ' + (error?.message || 'Unknown upstream error.')
         );
     }
-    if (!normalized.text.trim()) {
-        throw new GeminiApiError(502, 'Gemini upstream returned no text response.', {
-            statusText: 'BAD_GATEWAY',
-        });
-    }
-    return normalized;
+    // Injected providers may still use the legacy partial-result shape.
+    if (result?.truncated)
+        throw new GeminiApiError(502, 'Gemini upstream returned a truncated response.');
+    const text = typeof result === 'string' ? result : result?.text;
+    if (typeof text !== 'string' || !text.trim())
+        throw new GeminiApiError(502, 'Gemini upstream returned no text response.');
+    return text;
 }
 
 async function readRequestBody(request, maxBodyBytes, signal) {
@@ -688,7 +591,7 @@ async function readRequestBody(request, maxBodyBytes, signal) {
     });
 }
 
-function getRequestModel(model, adjustments = []) {
+function getRequestModel(model) {
     let normalized = normalizeModelId(model);
     const suffixIndex = normalized.indexOf('@');
     if (suffixIndex !== -1) {
@@ -699,7 +602,6 @@ function getRequestModel(model, adjustments = []) {
         normalized = Number.isSafeInteger(value)
             ? base + '@think=' + Math.min(4, Math.max(0, value))
             : base;
-        if (normalized !== base + suffix) recordAdjustment(adjustments, 'model.@think');
     }
     try {
         resolveNoAuthModel(normalized);
@@ -709,20 +611,12 @@ function getRequestModel(model, adjustments = []) {
     return normalized;
 }
 
-function requireContents(body) {
-    if (!Array.isArray(body.contents) || body.contents.length === 0) {
-        throw new GeminiApiError(400, 'contents must be a non-empty array.', { param: 'contents' });
-    }
-}
-
 async function handleGenerate(request, response, options, model, method) {
-    const adjustments = [];
-    const requestedModel = getRequestModel(model, adjustments);
+    const requestedModel = getRequestModel(model);
     const body = await readRequestBody(request, options.maxBodyBytes, options.signal);
-    requireContents(body);
-    const context = buildPrompt(body, adjustments);
-    const targetModel = applyThinking(requestedModel, context.thinking, adjustments);
-    setOptionHeaders(response, adjustments, targetModel);
+    const context = buildPrompt(body);
+    const targetModel = applyThinking(requestedModel, context.thinking);
+    response.setHeader('X-Gemini-Thinking-Mode', String(resolveNoAuthModel(targetModel).think));
     if (options.state.active >= options.maxConcurrentRequests) {
         throw new GeminiApiError(429, 'Too many active generation requests.', { retryAfter: '1' });
     }
@@ -738,17 +632,13 @@ async function handleGenerate(request, response, options, model, method) {
     response.setHeader('X-Gemini-Token-Count', 'estimated');
     try {
         if (method !== 'streamGenerateContent') {
-            const result = await callProvider({
+            const text = await callProvider({
                 prompt: context.prompt,
                 model: targetModel,
                 signal,
                 sendMessage: options.sendMessage,
             });
-            writeJson(
-                response,
-                200,
-                createGenerateResponse(targetModel, result.text, context, context.prompt)
-            );
+            writeJson(response, 200, createGenerateResponse(text, context));
             return;
         }
         response.statusCode = 200;
@@ -768,7 +658,7 @@ async function handleGenerate(request, response, options, model, method) {
                 response.write(': keep-alive\n\n');
         }, 10_000);
         heartbeat.unref?.();
-        const bufferTools = context.declarations.length > 0 && context.toolMode.mode !== 'NONE';
+        const bufferTools = context.declarations.length > 0;
         let streamedText = '';
         const update = (next) => {
             signal.throwIfAborted();
@@ -785,27 +675,16 @@ async function handleGenerate(request, response, options, model, method) {
             });
         };
         try {
-            const result = await callProvider({
+            const text = await callProvider({
                 prompt: context.prompt,
                 model: targetModel,
                 signal,
                 sendMessage: options.sendMessage,
                 onUpdate: bufferTools ? undefined : update,
             });
-            if (bufferTools) {
-                await writer.write({
-                    candidates: [createCandidate(toResponseParts(result.text, context))],
-                    modelVersion: MODEL_VERSION,
-                    usageMetadata: createUsageMetadata(context.prompt, result.text),
-                });
-            } else {
-                await update(result.text);
-                await writer.write({
-                    candidates: [createCandidate([])],
-                    modelVersion: MODEL_VERSION,
-                    usageMetadata: createUsageMetadata(context.prompt, result.text),
-                });
-            }
+            if (!bufferTools) await update(text);
+            const parts = bufferTools ? toResponseParts(text, context) : [];
+            await writer.write(createGenerateResponse(text, context, parts));
             await writer.flush();
             endSse(response);
         } catch (error) {
@@ -823,24 +702,14 @@ async function handleGenerate(request, response, options, model, method) {
 }
 
 async function handleCountTokens(request, response, options, model) {
-    const adjustments = [];
-    const targetModel = getRequestModel(model, adjustments);
+    const targetModel = getRequestModel(model);
     const body = await readRequestBody(request, options.maxBodyBytes, options.signal);
     let input = body;
     const nested = body.generateContentRequest ?? body.generate_content_request;
-    if (nested !== undefined) {
-        if (!isObject(nested)) recordAdjustment(adjustments, 'generateContentRequest');
-        else {
-            if (body.contents !== undefined) recordAdjustment(adjustments, 'contents');
-            if (nested.model && normalizeModelId(nested.model) !== targetModel)
-                recordAdjustment(adjustments, 'generateContentRequest.model');
-            input = nested;
-        }
-    }
-    requireContents(input);
-    const context = buildPrompt(input, adjustments);
-    const effectiveModel = applyThinking(targetModel, context.thinking, adjustments);
-    setOptionHeaders(response, adjustments, effectiveModel);
+    if (isObject(nested)) input = nested;
+    const context = buildPrompt(input);
+    const effectiveModel = applyThinking(targetModel, context.thinking);
+    response.setHeader('X-Gemini-Thinking-Mode', String(resolveNoAuthModel(effectiveModel).think));
     const totalTokens = estimateTokens(context.prompt);
     response.setHeader('X-Gemini-Token-Count', 'estimated');
     writeJson(response, 200, {
@@ -892,7 +761,7 @@ async function routeRequest(request, response, options) {
         request.method === 'GET' &&
         (pathname === '/models' || pathname === '/v1/models' || pathname === '/v1beta/models')
     ) {
-        writeJson(response, 200, listModelsResponse());
+        writeJson(response, 200, { models: NOAUTH_MODEL_NAMES.map(modelResource) });
         return;
     }
 
@@ -902,9 +771,7 @@ async function routeRequest(request, response, options) {
     }
 
     if (request.method === 'GET' && action.method === null) {
-        const adjustments = [];
-        const model = getRequestModel(action.model, adjustments);
-        setOptionHeaders(response, adjustments, model);
+        const model = getRequestModel(action.model);
         writeJson(response, 200, modelResource(model));
         return;
     }
@@ -1072,19 +939,8 @@ export async function startGemini2ApiServer(options = {}) {
             : {}),
         ...options,
     });
-    await new Promise((resolve, reject) => {
-        const onError = (error) => {
-            server.off('listening', onListening);
-            reject(error);
-        };
-        const onListening = () => {
-            server.off('error', onError);
-            resolve();
-        };
-        server.once('error', onError);
-        server.once('listening', onListening);
-        server.listen(port, host);
-    });
+    server.listen(port, host);
+    await once(server, 'listening');
 
     const address = server.address();
     return {

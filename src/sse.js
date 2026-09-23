@@ -1,4 +1,5 @@
 import { UpstreamError } from './upstream_stream.js';
+import { once } from 'node:events';
 
 /** Serialize writes and propagate downstream backpressure to the upstream reader. */
 export function createSseWriter(response, signal, maxPendingBytes = 1024 * 1024) {
@@ -22,31 +23,12 @@ export function createSseWriter(response, signal, maxPendingBytes = 1024 * 1024)
                 if (response.destroyed || response.writableEnded)
                     throw new DOMException('Client disconnected', 'AbortError');
                 if (response.write(chunk)) return;
-                await new Promise((resolve, reject) => {
-                    const cleanup = () => {
-                        response.off('drain', drained);
-                        response.off('close', closed);
-                        response.off('error', failed);
-                        signal.removeEventListener('abort', aborted);
-                    };
-                    const drained = () => {
-                        cleanup();
-                        resolve();
-                    };
-                    const failed = (error) => {
-                        cleanup();
-                        reject(error);
-                    };
-                    const closed = () =>
-                        failed(new DOMException('Client disconnected', 'AbortError'));
-                    const aborted = () => failed(signal.reason);
-                    response.once('drain', drained);
-                    response.once('close', closed);
-                    response.once('error', failed);
-                    signal.addEventListener('abort', aborted, { once: true });
-                    if (signal.aborted) aborted();
-                    else if (response.destroyed) closed();
-                });
+                // The request lifecycle aborts signal on disconnect or timeout.
+                try {
+                    await once(response, 'drain', { signal });
+                } catch (error) {
+                    throw signal.aborted ? signal.reason : error;
+                }
             })
             .finally(() => {
                 pendingBytes -= size;
