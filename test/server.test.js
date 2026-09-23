@@ -32,7 +32,7 @@ describe('Gemini 2API server', () => {
         const body = await response.json();
 
         assert.equal(response.status, 200);
-        assert.equal(response.headers.get('access-control-allow-origin'), '*');
+        assert.equal(response.headers.get('access-control-allow-origin'), null);
         assert.ok(body.models.some((model) => model.name === 'models/gemini-3.8-flash'));
     });
 

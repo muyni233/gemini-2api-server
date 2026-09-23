@@ -1,116 +1,48 @@
-/**
- * "No-Auth Gemini" provider — embedded port of the gemini-web2api anonymous
- * StreamGenerate protocol (gemini_web2api/gemini.py + models.py).
- *
- * Talks directly to gemini.google.com without any API key, Google sign-in,
- * or a separate local server. bl (build label) is auto-fetched from the
- * page, mirroring web2api's auto-update + 405 retry.
- *
- * Multi-turn is simulated by folding history into the prompt (same as
- * web2api). Anonymous StreamGenerate supports text only.
- */
+import { randomUUID } from 'node:crypto';
+import { createDeadline, positiveInteger, withAbort } from './async_utils.js';
+import { cleanSnapshot, RpcStreamDecoder, UpstreamError } from './upstream_stream.js';
+
+// Protocol lineage: https://github.com/Sophomoresty/gemini-web2api
+// (gemini_web2api/gemini.py and models.py), via Gemini Nexus's noauth provider.
+
+export { UpstreamError } from './upstream_stream.js';
 export const DEFAULT_NOAUTH_MODEL = 'gemini-3.8-flash';
 
-function debugLog(...args) {
-    if (process.env.GEMINI_2API_DEBUG === '1') console.debug(...args);
-}
-
-// MODE_CATEGORY enum from Gemini frontend JS (gemini-web2api models.py):
-// 1=FAST 2=THINKING 3=PRO 4=AUTO 5=FAST_DYNAMIC_THINKING 6=FLASH_LITE
+// Compatibility aliases select Web UI modes, not verified backend model versions.
+// In particular anonymous Pro requests may be routed to Flash by Google.
 const MODELS = Object.freeze({
-    'gemini-3.8-flash': Object.freeze({ mode: 1, think: 4 }),
-    'gemini-3.7-flash': Object.freeze({ mode: 1, think: 4 }),
-    'gemini-3.5-flash': Object.freeze({ mode: 1, think: 4 }),
-    'gemini-3.5-flash-thinking': Object.freeze({ mode: 2, think: 0 }),
-    'gemini-3.1-pro': Object.freeze({ mode: 3, think: 4 }),
-    'gemini-3.1-pro-enhanced': Object.freeze({ mode: 3, think: 4, extra: { 31: 2, 80: 3 } }),
-    'gemini-auto': Object.freeze({ mode: 4, think: 4 }),
-    'gemini-3.5-flash-thinking-lite': Object.freeze({ mode: 5, think: 0 }),
-    'gemini-flash-lite': Object.freeze({ mode: 6, think: 4 }),
+    'gemini-3.8-flash': { mode: 1, think: 4 },
+    'gemini-3.7-flash': { mode: 1, think: 4 },
+    'gemini-3.5-flash': { mode: 1, think: 4 },
+    'gemini-3.5-flash-thinking': { mode: 2, think: 0 },
+    'gemini-3.1-pro': { mode: 3, think: 4 },
+    'gemini-3.1-pro-enhanced': { mode: 3, think: 4, extra: { 31: 2, 80: 3 } },
+    'gemini-auto': { mode: 4, think: 4 },
+    'gemini-3.5-flash-thinking-lite': { mode: 5, think: 0 },
+    'gemini-flash-lite': { mode: 6, think: 4 },
 });
-
-// Keep the public model catalogue next to the protocol mapping so API clients
-// can discover the exact model aliases accepted by the anonymous provider.
 export const NOAUTH_MODEL_NAMES = Object.freeze(Object.keys(MODELS));
-
-const FALLBACK_BL = 'boq_assistant-bard-web-server_20260716.08_p0';
-const BL_PATTERN = /(boq_assistant-bard-web-server_\d+\.\d+_p\d+)/;
+const FALLBACK_BL = 'boq_assistant-bard-web-server_20260921.20_p0';
+const BL_PATTERN = /boq_assistant-bard-web-server_\d+\.\d+_p\d+/;
+const COMPLETE_BL_PATTERN = /boq_assistant-bard-web-server_\d+\.\d+_p\d+(?=\D)/;
 const USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36';
-const PAGE_TIMEOUT_MS = 15_000;
-const GENERATION_TIMEOUT_MS = 180_000;
 
-let cachedBl = '';
-
-function withTimeout(signal, timeoutMs) {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(new Error('Request timed out.')), timeoutMs);
-    timer.unref?.();
-    const abortFromParent = () => controller.abort(signal?.reason);
-    controller.signal.addEventListener(
-        'abort',
-        () => {
-            clearTimeout(timer);
-            signal?.removeEventListener('abort', abortFromParent);
-        },
-        { once: true }
-    );
-    if (signal) {
-        if (signal.aborted) abortFromParent();
-        else signal.addEventListener('abort', abortFromParent, { once: true });
-    }
-    return controller.signal;
+export function resolveNoAuthModel(model = DEFAULT_NOAUTH_MODEL) {
+    const match = /^([^@]+)(?:@think=([0-4]))?$/.exec(String(model));
+    if (!match)
+        throw new UpstreamError('Model suffix must be @think=0 through @think=4.', { status: 400 });
+    if (!Object.hasOwn(MODELS, match[1]))
+        throw new UpstreamError(`Model ${match[1]} not found.`, { status: 404 });
+    const config = MODELS[match[1]];
+    return {
+        ...config,
+        ...(config.extra ? { extra: { ...config.extra } } : {}),
+        name: match[1],
+        think: match[2] === undefined ? config.think : Number(match[2]),
+    };
 }
 
-function resolveModel(modelName) {
-    let name = String(modelName || '').trim() || DEFAULT_NOAUTH_MODEL;
-    let thinkOverride = null;
-    const thinkIdx = name.indexOf('@think=');
-    if (thinkIdx !== -1) {
-        const suffix = name.slice(thinkIdx + '@think='.length);
-        name = name.slice(0, thinkIdx);
-        const parsed = Number.parseInt(suffix, 10);
-        if (Number.isFinite(parsed)) thinkOverride = parsed;
-    }
-    const cfg = MODELS[name];
-    if (!cfg) {
-        const fallback = MODELS[DEFAULT_NOAUTH_MODEL];
-        debugLog(
-            `[No-Auth Gemini] Unknown model '${name}', falling back to '${DEFAULT_NOAUTH_MODEL}'`
-        );
-        return {
-            ...fallback,
-            modelId: fallback.mode,
-            thinkMode: thinkOverride ?? fallback.think,
-        };
-    }
-    return { ...cfg, modelId: cfg.mode, thinkMode: thinkOverride ?? cfg.think };
-}
-
-async function fetchLatestBl(signal) {
-    try {
-        const response = await fetch('https://gemini.google.com/app', {
-            headers: { 'User-Agent': USER_AGENT },
-            credentials: 'omit',
-            signal: withTimeout(signal, PAGE_TIMEOUT_MS),
-        });
-        if (!response.ok) return null;
-        const html = await response.text();
-        const match = html.match(BL_PATTERN);
-        return match ? match[1] : null;
-    } catch {
-        return null;
-    }
-}
-
-async function getBl(forceRefresh = false, signal) {
-    if (!cachedBl || forceRefresh) {
-        const latest = await fetchLatestBl(signal);
-        if (latest) cachedBl = latest;
-    }
-    return cachedBl || FALLBACK_BL;
-}
-
-function buildPayload(prompt, modelId, thinkMode, extraFields) {
+function buildPayload(prompt, config) {
     const inner = new Array(102).fill(null);
     inner[0] = [prompt, 0, null, null, null, null, 0];
     inner[1] = ['en'];
@@ -119,180 +51,278 @@ function buildPayload(prompt, modelId, thinkMode, extraFields) {
     inner[7] = 1;
     inner[10] = 1;
     inner[11] = 0;
-    inner[17] = [[thinkMode]];
+    inner[17] = [[config.think]];
     inner[18] = 0;
     inner[27] = 1;
     inner[30] = [4];
-    inner[41] = [2]; // persist to account history (web2api temporary_chats=false)
+    inner[41] = [2];
     inner[53] = 0;
-    inner[59] = crypto.randomUUID();
+    inner[59] = randomUUID();
     inner[61] = [];
     inner[68] = 1;
-    inner[79] = modelId;
-    if (extraFields) {
-        for (const [key, value] of Object.entries(extraFields)) inner[key] = value;
-    }
-    const outer = [null, JSON.stringify(inner)];
-    return new URLSearchParams({ 'f.req': JSON.stringify(outer) });
+    inner[79] = config.mode;
+    for (const [key, value] of Object.entries(config.extra || {})) inner[key] = value;
+    return new URLSearchParams({ 'f.req': JSON.stringify([null, JSON.stringify(inner)]) });
 }
 
-function cleanText(text, strip = true) {
-    let cleaned = String(text || '').replace(
-        /```(?:python|javascript|text)\?code_(?:reference|stdout)&code_event_index=\d+\n.*?```\n?/gs,
-        ''
-    );
-    cleaned = cleaned.replace(/http:\/\/googleusercontent\.com\/card_content\/\d+\n?/g, '');
-    return strip ? cleaned.trim() : cleaned;
-}
-
-function extractTextsFromLine(line) {
-    if (!line.includes('"wrb.fr"') || line.length < 200) return [];
-    try {
-        const arr = JSON.parse(line);
-        const innerStr = arr?.[0]?.[2];
-        if (!innerStr || innerStr.length < 50) return [];
-        const inner = JSON.parse(innerStr);
-        if (!Array.isArray(inner) || inner.length <= 4 || !inner[4]) return [];
-        const texts = [];
-        for (const part of inner[4]) {
-            if (Array.isArray(part) && part.length > 1 && part[1] && Array.isArray(part[1])) {
-                for (const t of part[1]) {
-                    if (typeof t === 'string' && t) texts.push(t);
-                }
-            }
-        }
-        return texts;
-    } catch {
-        return [];
-    }
-}
-
-function buildEndpoint(bl) {
+function endpoint(bl) {
     const params = new URLSearchParams({
         bl,
         hl: 'en',
         _reqid: String(Date.now() % 1000000),
         rt: 'c',
     });
-    return `https://gemini.google.com/_/BardChatUi/data/assistant.lamda.BardFrontendService/StreamGenerate?${params.toString()}`;
+    return `https://gemini.google.com/_/BardChatUi/data/assistant.lamda.BardFrontendService/StreamGenerate?${params}`;
 }
 
-function buildHeaders() {
-    return {
-        'Content-Type': 'application/x-www-form-urlencoded',
-        Origin: 'https://gemini.google.com',
-        Referer: 'https://gemini.google.com/app',
-        'X-Same-Domain': '1',
-        'User-Agent': USER_AGENT,
-    };
+function timeoutError() {
+    return new UpstreamError('Gemini upstream request timed out.', { status: 504 });
 }
 
-/**
- * Sends a single message through the anonymous StreamGenerate protocol.
- * Returns { text } or { text, truncated: true, error } on mid-stream failure.
- */
-export async function sendNoAuthGeminiMessage(prompt, model, files, signal, onUpdate) {
-    const { modelId, thinkMode, extra } = resolveModel(model);
-    const body = buildPayload(prompt, modelId, thinkMode, extra);
-    const requestSignal = withTimeout(signal, GENERATION_TIMEOUT_MS);
+async function cancelBody(body) {
+    try {
+        await body?.cancel();
+    } catch {
+        /* The transport may already have aborted. */
+    }
+}
 
-    // One retry after refreshing bl on upstream rejection (405 / BardErrorInfo),
-    // matching gemini-web2api's auto-update behaviour.
-    for (let attempt = 0; attempt < 2; attempt++) {
-        const bl = await getBl(attempt === 1, requestSignal);
-        debugLog(`[No-Auth Gemini] POST StreamGenerate (${bl}, attempt ${attempt + 1})`);
+export function createNoAuthGeminiProvider({
+    fetchImpl = (...args) => fetch(...args),
+    now = Date.now,
+    generationTimeoutMs = 180_000,
+    pageTimeoutMs = 15_000,
+    buildLabelTtlMs = 3_600_000,
+    buildLabelFailureTtlMs = 30_000,
+    maxResponseBytes = 16 * 1024 * 1024,
+    maxFrameChars = 4 * 1024 * 1024,
+} = {}) {
+    for (const [name, value] of Object.entries({
+        generationTimeoutMs,
+        pageTimeoutMs,
+        buildLabelTtlMs,
+        buildLabelFailureTtlMs,
+        maxResponseBytes,
+        maxFrameChars,
+    }))
+        positiveInteger(value, name);
+    if (typeof fetchImpl !== 'function' || typeof now !== 'function')
+        throw new TypeError('fetchImpl and now must be functions.');
+    let cachedBl = FALLBACK_BL;
+    let expiresAt = 0;
+    let revision = 0;
+    let refreshing;
+    const lifetime = new AbortController();
+    const activeDeadlines = new Set();
 
-        let response;
+    async function refreshBl() {
+        const deadline = createDeadline(lifetime.signal, pageTimeoutMs, timeoutError());
+        let reader;
+        let found = false;
         try {
-            response = await fetch(buildEndpoint(bl), {
-                method: 'POST',
-                signal: requestSignal,
-                headers: buildHeaders(),
+            const response = await fetchImpl('https://gemini.google.com/app', {
+                headers: { 'User-Agent': USER_AGENT },
                 credentials: 'omit',
-                body,
+                signal: deadline.signal,
             });
-        } catch (error) {
-            if (error.name === 'AbortError') throw error;
-            throw new Error(`Failed to fetch Gemini upstream: ${error.message || error}`);
-        }
-
-        if (response.status === 405) {
-            if (attempt === 0) continue;
-            throw new Error('Gemini upstream rejected request: HTTP 405');
-        }
-        if (!response.ok) {
-            throw new Error(`Network Error: ${response.status} ${response.statusText}`);
-        }
-
-        const reader = response.body.getReader();
-        const decoder = new TextDecoder('utf-8');
-        let buffer = '';
-        let emittedRawText = '';
-        let streamError = null;
-
-        try {
+            if (!response.ok || !response.body) {
+                await cancelBody(response.body);
+                return;
+            }
+            reader = response.body.getReader();
+            const decoder = new TextDecoder();
+            let tail = '';
+            let size = 0;
             for (;;) {
-                const { done, value } = await reader.read();
-                if (done) break;
-                buffer += decoder.decode(value, { stream: true });
-
-                if (buffer.includes('BardErrorInfo')) {
-                    const m = buffer.match(/BardErrorInfo[^\d]{0,24}\[(\d+)\]/);
-                    throw new Error(
-                        `Gemini upstream rejected request: BardErrorInfo${m ? ` [${m[1]}]` : ''}`
-                    );
+                const { done, value } = await withAbort(reader.read(), deadline.signal);
+                size += value?.byteLength || 0;
+                if (size > 4 * 1024 * 1024) break;
+                tail += decoder.decode(value, { stream: !done });
+                // The final build-number digits can straddle network chunks.
+                // Wait for a delimiter or EOF before committing the cached label.
+                const match = tail.match(done ? BL_PATTERN : COMPLETE_BL_PATTERN);
+                if (match) {
+                    cachedBl = match[0];
+                    found = true;
+                    break;
                 }
+                if (done) break;
+                tail = tail.slice(-256);
+            }
+        } catch (error) {
+            if (process.env.GEMINI_2API_DEBUG === '1')
+                console.debug('[Gemini] Build label refresh failed:', error.message);
+        } finally {
+            if (reader) {
+                try {
+                    await reader.cancel();
+                } catch {
+                    /* Already aborted. */
+                }
+                reader.releaseLock();
+            }
+            deadline.dispose();
+            revision++;
+            expiresAt = now() + (found ? buildLabelTtlMs : buildLabelFailureTtlMs);
+        }
+    }
 
-                let newlineIndex;
-                while ((newlineIndex = buffer.indexOf('\n')) !== -1) {
-                    const line = buffer.slice(0, newlineIndex);
-                    buffer = buffer.slice(newlineIndex + 1);
-                    for (const t of extractTextsFromLine(line)) {
-                        if (t === emittedRawText || emittedRawText.startsWith(t)) continue;
-                        if (!t.startsWith(emittedRawText)) {
-                            throw new Error('Gemini stream content changed during retry');
+    async function getBl(signal, rejectedRevision) {
+        signal.throwIfAborted();
+        const needsRefresh =
+            rejectedRevision === undefined ? now() >= expiresAt : revision === rejectedRevision;
+        if (needsRefresh || refreshing) {
+            if (!refreshing)
+                refreshing = refreshBl().finally(() => {
+                    refreshing = undefined;
+                });
+            await withAbort(refreshing, signal);
+        }
+        return { bl: cachedBl, revision };
+    }
+
+    const sendMessage = async function (prompt, model, files = [], parentSignal, onUpdate) {
+        lifetime.signal.throwIfAborted();
+        if (typeof prompt !== 'string' || !prompt.trim())
+            throw new UpstreamError('Prompt must be non-empty text.', { status: 400 });
+        if (!Array.isArray(files) || files.length)
+            throw new UpstreamError('Anonymous Gemini supports text only.', { status: 400 });
+        const config = resolveNoAuthModel(model);
+        const deadline = createDeadline(parentSignal, generationTimeoutMs, timeoutError());
+        activeDeadlines.add(deadline);
+        const signal = deadline.signal;
+        const body = buildPayload(prompt, config);
+        let previousRevision;
+        try {
+            for (let attempt = 0; attempt < 2; attempt++) {
+                const build = await getBl(signal, previousRevision);
+                previousRevision = build.revision;
+                signal.throwIfAborted();
+                let reader;
+                let rawText = '';
+                let emittedText = '';
+                let selectedId;
+                let completion;
+                let bytes = 0;
+                const parser = new RpcStreamDecoder(maxFrameChars);
+                try {
+                    const response = await fetchImpl(endpoint(build.bl), {
+                        method: 'POST',
+                        signal,
+                        credentials: 'omit',
+                        body,
+                        headers: {
+                            'Content-Type': 'application/x-www-form-urlencoded',
+                            Origin: 'https://gemini.google.com',
+                            Referer: 'https://gemini.google.com/app',
+                            'X-Same-Domain': '1',
+                            'User-Agent': USER_AGENT,
+                        },
+                    });
+                    if (!response.ok) {
+                        await cancelBody(response.body);
+                        throw new UpstreamError(
+                            `Gemini upstream returned HTTP ${response.status}.`,
+                            {
+                                status: [429, 503, 504].includes(response.status)
+                                    ? response.status
+                                    : 502,
+                                refreshBuild: response.status === 405,
+                                retryAfter: response.headers.get('retry-after') || undefined,
+                            }
+                        );
+                    }
+                    if (!response.body)
+                        throw new UpstreamError('Gemini upstream returned no response body.');
+                    reader = response.body.getReader();
+                    for (;;) {
+                        signal.throwIfAborted();
+                        const { done, value } = await withAbort(reader.read(), signal);
+                        bytes += value?.byteLength || 0;
+                        if (bytes > maxResponseBytes)
+                            throw new UpstreamError(
+                                'Gemini response exceeds the configured size limit.'
+                            );
+                        for (const event of parser.push(value, done)) {
+                            if (event.error) throw event.error;
+                            const candidates = event.candidates.filter(
+                                (candidate) =>
+                                    Array.isArray(candidate) &&
+                                    Array.isArray(candidate[1]) &&
+                                    typeof candidate[1][0] === 'string' &&
+                                    (candidate[0] == null || typeof candidate[0] === 'string')
+                            );
+                            const candidate =
+                                selectedId === undefined
+                                    ? candidates.find((c) => typeof c?.[1]?.[0] === 'string')
+                                    : candidates.find((c) => (c?.[0] ?? null) === selectedId);
+                            if (!candidate || typeof candidate[1]?.[0] !== 'string') continue;
+                            if (selectedId === undefined) selectedId = candidate[0] ?? null;
+                            rawText = candidate[1][0];
+                            if ([1, 2].includes(candidate[8]?.[0])) completion = candidate[8][0];
+                            const next = cleanSnapshot(rawText);
+                            if (onUpdate && next !== emittedText) {
+                                if (!next.startsWith(emittedText))
+                                    throw new UpstreamError(
+                                        'Gemini revised text that was already streamed.'
+                                    );
+                                await withAbort(onUpdate(next), signal);
+                                emittedText = next;
+                            }
                         }
-                        emittedRawText = t;
-                        if (onUpdate) onUpdate(cleanText(emittedRawText), undefined);
+                        if (done) break;
+                    }
+                    if (completion === 1)
+                        throw new UpstreamError(
+                            'Gemini stream ended before its completion marker.'
+                        );
+                    const text = cleanSnapshot(rawText, true);
+                    if (!text.trim())
+                        throw new UpstreamError(
+                            'Gemini returned no text candidate (possible protocol, access, or media-only response).'
+                        );
+                    if (onUpdate && text !== emittedText) {
+                        if (!text.startsWith(emittedText))
+                            throw new UpstreamError(
+                                'Gemini final text differs from the streamed response.'
+                            );
+                        await withAbort(onUpdate(text), signal);
+                    }
+                    return { text };
+                } catch (error) {
+                    if (signal.aborted) throw signal.reason;
+                    // A new generation must never be appended after output from a failed one.
+                    if (attempt === 0 && !rawText && error.refreshBuild === true) continue;
+                    if (rawText)
+                        return { text: cleanSnapshot(rawText, true), truncated: true, error };
+                    throw error instanceof UpstreamError
+                        ? error
+                        : new UpstreamError(
+                              `Failed to read Gemini upstream: ${error.message || error}`
+                          );
+                } finally {
+                    if (reader) {
+                        try {
+                            await reader.cancel();
+                        } catch {
+                            /* Already closed or aborted. */
+                        }
+                        reader.releaseLock();
                     }
                 }
             }
-        } catch (error) {
-            if (error.name === 'AbortError') throw error;
-            if (attempt === 0 && /BardErrorInfo/.test(error.message)) {
-                continue; // refresh bl and retry
-            }
-            streamError = error; // includes upstream rejection on final attempt
+            throw new UpstreamError('Gemini upstream retry exhausted.');
+        } finally {
+            deadline.dispose();
+            activeDeadlines.delete(deadline);
         }
-
-        // Tail: a final line may end without a trailing newline.
-        if (buffer.length > 0) {
-            for (const t of extractTextsFromLine(buffer)) {
-                if (t.startsWith(emittedRawText) && t !== emittedRawText) {
-                    emittedRawText = t;
-                    if (onUpdate) onUpdate(cleanText(emittedRawText), undefined);
-                }
-            }
-        }
-
-        if (!emittedRawText) {
-            if (/BardErrorInfo/.test(String(streamError?.message || ''))) {
-                throw streamError;
-            }
-            const hint = buffer.includes('Sign in') ? ' (session required?)' : '';
-            throw new Error(
-                `No valid response found. Check network.${hint}${
-                    streamError ? ` (stream error: ${streamError.message || streamError})` : ''
-                }`
-            );
-        }
-
-        if (streamError) {
-            return { text: cleanText(emittedRawText), truncated: true, error: streamError };
-        }
-
-        return { text: cleanText(emittedRawText) };
-    }
-
-    throw new Error('Gemini upstream rejected request (retry exhausted).');
+    };
+    sendMessage.close = () => {
+        const error = new UpstreamError('Gemini provider is closed.', { status: 503 });
+        lifetime.abort(error);
+        for (const deadline of activeDeadlines) deadline.abort(error);
+    };
+    return sendMessage;
 }
+
+export const sendNoAuthGeminiMessage = createNoAuthGeminiProvider();

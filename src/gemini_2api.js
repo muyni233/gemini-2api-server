@@ -1,20 +1,26 @@
 import { createServer } from 'node:http';
+import { createHash, timingSafeEqual } from 'node:crypto';
+import { createDeadline, positiveInteger, withAbort } from './async_utils.js';
+import { createSseWriter } from './sse.js';
+import { normalizeRequestOptions, recordAdjustment } from './request_options.js';
 import {
     DEFAULT_NOAUTH_MODEL,
     NOAUTH_MODEL_NAMES,
-    sendNoAuthGeminiMessage,
+    createNoAuthGeminiProvider,
+    resolveNoAuthModel,
+    UpstreamError,
 } from './noauth_provider.js';
 
 export const DEFAULT_HOST = '127.0.0.1';
 export const DEFAULT_PORT = 8787;
 export const DEFAULT_MAX_BODY_BYTES = 2 * 1024 * 1024;
+const MODEL_VERSION = 'gemini-web-unverified';
 
 const API_VERSION_PREFIXES = new Set(['', 'v1', 'v1beta']);
 const GENERATE_METHODS = new Set(['generateContent', 'streamGenerateContent']);
 const ROLE_NAMES = new Set(['user', 'model', 'assistant']);
-
 const MODEL_DESCRIPTION = Object.freeze({
-    supportedGenerationMethods: ['generateContent', 'streamGenerateContent'],
+    supportedGenerationMethods: ['generateContent', 'streamGenerateContent', 'countTokens'],
 });
 
 /**
@@ -28,21 +34,28 @@ export class GeminiApiError extends Error {
         this.statusText = options.statusText || statusToStatusText(status);
         this.code = options.code || this.statusText;
         this.param = options.param;
+        this.retryAfter = options.retryAfter;
     }
 }
 
 function statusToStatusText(status) {
     if (status === 400) return 'INVALID_ARGUMENT';
+    if (status === 401) return 'UNAUTHENTICATED';
+    if (status === 403) return 'PERMISSION_DENIED';
     if (status === 404) return 'NOT_FOUND';
     if (status === 413) return 'RESOURCE_EXHAUSTED';
+    if (status === 429) return 'RESOURCE_EXHAUSTED';
     if (status === 499) return 'CANCELLED';
     if (status === 502) return 'BAD_GATEWAY';
     if (status === 503) return 'UNAVAILABLE';
+    if (status === 504) return 'DEADLINE_EXCEEDED';
     return 'INTERNAL';
 }
 
 function getErrorStatus(error) {
-    return Number.isInteger(error?.status) ? error.status : 500;
+    return Number.isInteger(error?.status) && error.status >= 400 && error.status <= 599
+        ? error.status
+        : 500;
 }
 
 function getErrorMessage(error) {
@@ -76,19 +89,44 @@ function createErrorBody(error) {
     };
 }
 
-function setCorsHeaders(response) {
-    response.setHeader('Access-Control-Allow-Origin', '*');
+function setCorsHeaders(request, response, options) {
+    response.setHeader('Cache-Control', 'no-store');
+    response.setHeader('X-Content-Type-Options', 'nosniff');
+    response.setHeader('Vary', 'Origin');
+    const origin = request.headers.origin;
+    if (origin) {
+        let allowed =
+            options.allowedOrigins?.includes('*') || options.allowedOrigins?.includes(origin);
+        if (options.allowedOrigins === undefined) {
+            try {
+                const url = new URL(origin);
+                allowed =
+                    ['http:', 'https:'].includes(url.protocol) &&
+                    url.origin === origin &&
+                    ['localhost', '127.0.0.1', '[::1]'].includes(url.hostname);
+            } catch {
+                allowed = false;
+            }
+        }
+        if (!allowed) throw new GeminiApiError(403, 'Browser origin is not allowed.');
+        response.setHeader(
+            'Access-Control-Allow-Origin',
+            options.allowedOrigins?.includes('*') ? '*' : origin
+        );
+    }
     response.setHeader(
         'Access-Control-Allow-Headers',
-        'Content-Type, Authorization, X-Goog-Api-Key'
+        'Content-Type, Authorization, X-Goog-Api-Key, X-Api-Key, X-Goog-Api-Client'
     );
     response.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-    response.setHeader('Access-Control-Expose-Headers', 'Content-Type');
-    response.setHeader('Cache-Control', 'no-store');
+    response.setHeader(
+        'Access-Control-Expose-Headers',
+        'Content-Type, Retry-After, X-Gemini-Token-Count, X-Gemini-Thinking-Mode, X-Gemini-Adjusted-Parameters'
+    );
 }
 
 function writeJson(response, status, value) {
-    if (response.writableEnded) return;
+    if (response.writableEnded || response.destroyed) return;
     const body = JSON.stringify(value);
     response.statusCode = status;
     response.setHeader('Content-Type', 'application/json; charset=utf-8');
@@ -97,13 +135,11 @@ function writeJson(response, status, value) {
 }
 
 function writeError(response, error) {
+    if (error?.retryAfter && /^[\w ,:\-]+$/.test(String(error.retryAfter))) {
+        response.setHeader('Retry-After', String(error.retryAfter).slice(0, 128));
+    }
+    if (getErrorStatus(error) === 413) response.setHeader('Connection', 'close');
     writeJson(response, getErrorStatus(error), createErrorBody(error));
-}
-
-function writeSse(response, value) {
-    if (response.writableEnded || response.destroyed) return false;
-    response.write(`data: ${JSON.stringify(value)}\n\n`);
-    return true;
 }
 
 function endSse(response) {
@@ -130,7 +166,7 @@ function parseModelPath(pathname) {
     const parts = normalizePath(pathname).split('/').filter(Boolean);
     if (API_VERSION_PREFIXES.has(parts[0])) parts.shift();
 
-    if (parts[0] !== 'models' || !parts[1]) return null;
+    if (parts[0] !== 'models' || !parts[1] || parts.length !== 2) return null;
     const modelAndMethod = parts.slice(1).join('/');
     const methodIndex = modelAndMethod.lastIndexOf(':');
     if (methodIndex === -1) {
@@ -163,7 +199,8 @@ function modelResource(model) {
         baseModelId: id.split('@')[0],
         version: 'web-noauth',
         displayName: id,
-        description: 'Gemini Nexus anonymous Gemini Web bridge',
+        description:
+            'Anonymous Gemini Web mode alias; backend version is unverified. Pro aliases may fall back to Flash. Token counts are estimates.',
         ...MODEL_DESCRIPTION,
     };
 }
@@ -184,6 +221,26 @@ function readTextPart(part) {
         });
     }
 
+    const variants = [
+        'text',
+        'inlineData',
+        'inline_data',
+        'fileData',
+        'file_data',
+        'functionCall',
+        'function_call',
+        'functionResponse',
+        'function_response',
+        'executableCode',
+        'executable_code',
+        'codeExecutionResult',
+        'code_execution_result',
+    ];
+    if (variants.filter((key) => Object.hasOwn(part, key)).length !== 1) {
+        throw new GeminiApiError(400, 'Each content part must contain exactly one data variant.', {
+            param: 'contents.parts',
+        });
+    }
     if (typeof part.text === 'string') return part.text;
 
     if (part.inlineData || part.inline_data) {
@@ -204,18 +261,27 @@ function readTextPart(part) {
 
     if (part.functionCall || part.function_call) {
         const call = part.functionCall || part.function_call;
-        if (!isObject(call) || typeof call.name !== 'string') {
+        if (
+            !isObject(call) ||
+            typeof call.name !== 'string' ||
+            !call.name.trim() ||
+            (call.args !== undefined && !isObject(call.args))
+        ) {
             throw new GeminiApiError(400, 'functionCall must contain a function name.', {
                 param: 'contents.parts.functionCall',
             });
         }
-        const id = typeof call.id === 'string' && call.id ? ` id="${call.id}"` : '';
-        return `<function_call_result name="${call.name}"${id}>${JSON.stringify(call.args || {})}</function_call_result>`;
+        return `<function_call>${JSON.stringify({ name: call.name, args: call.args ?? {}, ...(call.id ? { id: call.id } : {}) })}</function_call>`;
     }
 
     if (part.functionResponse || part.function_response) {
         const response = part.functionResponse || part.function_response;
-        if (!isObject(response) || typeof response.name !== 'string') {
+        if (
+            !isObject(response) ||
+            typeof response.name !== 'string' ||
+            !response.name.trim() ||
+            (response.response !== undefined && !isObject(response.response))
+        ) {
             throw new GeminiApiError(400, 'functionResponse must contain a function name.', {
                 param: 'contents.parts.functionResponse',
             });
@@ -277,78 +343,6 @@ function readSystemInstruction(systemInstruction) {
     return readParts(systemInstruction.parts, 'systemInstruction.parts').trim();
 }
 
-function getFunctionDeclarations(tools) {
-    if (tools == null) return [];
-    if (!Array.isArray(tools)) {
-        throw new GeminiApiError(400, 'tools must be an array.', { param: 'tools' });
-    }
-
-    const declarations = [];
-    tools.forEach((tool, toolIndex) => {
-        if (!isObject(tool)) {
-            throw new GeminiApiError(400, 'Each tool must be an object.', {
-                param: `tools[${toolIndex}]`,
-            });
-        }
-        const rawDeclarations = tool.functionDeclarations || tool.function_declarations;
-        if (rawDeclarations == null) return;
-        if (!Array.isArray(rawDeclarations)) {
-            throw new GeminiApiError(400, 'functionDeclarations must be an array.', {
-                param: `tools[${toolIndex}].functionDeclarations`,
-            });
-        }
-        rawDeclarations.forEach((declaration, declarationIndex) => {
-            if (
-                !isObject(declaration) ||
-                typeof declaration.name !== 'string' ||
-                !declaration.name.trim()
-            ) {
-                throw new GeminiApiError(400, 'Every function declaration needs a name.', {
-                    param: `tools[${toolIndex}].functionDeclarations[${declarationIndex}]`,
-                });
-            }
-            declarations.push({
-                name: declaration.name.trim(),
-                description:
-                    typeof declaration.description === 'string' ? declaration.description : '',
-                parameters:
-                    declaration.parametersJsonSchema ||
-                    declaration.parameters_json_schema ||
-                    declaration.parameters ||
-                    {},
-            });
-        });
-    });
-
-    const seen = new Set();
-    return declarations.filter((declaration) => {
-        if (seen.has(declaration.name)) return false;
-        seen.add(declaration.name);
-        return true;
-    });
-}
-
-function readToolMode(toolConfig) {
-    const config = toolConfig?.functionCallingConfig || toolConfig?.function_calling_config;
-    if (!config) return { mode: 'AUTO', allowedFunctionNames: [] };
-    const mode = String(config.mode || 'AUTO').toUpperCase();
-    if (!['AUTO', 'ANY', 'NONE'].includes(mode)) {
-        throw new GeminiApiError(400, `Unsupported function calling mode: ${mode}.`, {
-            param: 'toolConfig.functionCallingConfig.mode',
-        });
-    }
-    const allowedFunctionNames = config.allowedFunctionNames || config.allowed_function_names || [];
-    if (
-        !Array.isArray(allowedFunctionNames) ||
-        allowedFunctionNames.some((name) => typeof name !== 'string')
-    ) {
-        throw new GeminiApiError(400, 'allowedFunctionNames must be an array of strings.', {
-            param: 'toolConfig.functionCallingConfig.allowedFunctionNames',
-        });
-    }
-    return { mode, allowedFunctionNames };
-}
-
 function formatToolPrompt(declarations, toolMode) {
     if (declarations.length === 0 || toolMode.mode === 'NONE') return '';
 
@@ -390,7 +384,8 @@ function formatConversation(contents) {
         .join('\n\n');
 }
 
-function buildPrompt(request) {
+function buildPrompt(request, adjustments = []) {
+    const { thinking, declarations, toolMode } = normalizeRequestOptions(request, adjustments);
     const contents = request.contents.map(normalizeContent);
     if (contents.length === 0) {
         throw new GeminiApiError(400, 'contents must contain at least one item.', {
@@ -398,9 +393,13 @@ function buildPrompt(request) {
         });
     }
 
-    const system = readSystemInstruction(request.systemInstruction || request.system_instruction);
-    const declarations = getFunctionDeclarations(request.tools);
-    const toolMode = readToolMode(request.toolConfig || request.tool_config);
+    const system = readSystemInstruction(request.systemInstruction ?? request.system_instruction);
+    if (!contents.some((content) => content.text.trim())) {
+        throw new GeminiApiError(
+            400,
+            'contents must contain non-empty text or a function exchange.'
+        );
+    }
     const sections = [];
 
     if (system) sections.push(`System instruction:\n${system}`);
@@ -424,7 +423,33 @@ function buildPrompt(request) {
         declarations,
         toolMode,
         contents,
+        thinking,
+        adjustments,
     };
+}
+
+function applyThinking(model, thinking, adjustments) {
+    if (!thinking) return model;
+    const config = resolveNoAuthModel(model);
+    if (model.includes('@think=') && config.think !== thinking.mode)
+        recordAdjustment(adjustments, 'model.@think');
+    return config.name + '@think=' + thinking.mode;
+}
+
+function setOptionHeaders(response, adjustments, model) {
+    response.setHeader('X-Gemini-Thinking-Mode', String(resolveNoAuthModel(model).think));
+    const fields = [];
+    let size = 0;
+    for (const field of adjustments) {
+        const encoded = encodeURIComponent(field);
+        if (size + encoded.length > 1800) {
+            fields.push('...');
+            break;
+        }
+        fields.push(encoded);
+        size += encoded.length + 2;
+    }
+    if (fields.length) response.setHeader('X-Gemini-Adjusted-Parameters', fields.join(', '));
 }
 
 function parseJsonObject(value) {
@@ -458,48 +483,65 @@ function normalizeFunctionCall(candidate, declarations, toolMode) {
 
 function parseFunctionCalls(text, declarations, toolMode) {
     if (declarations.length === 0 || toolMode.mode === 'NONE') return null;
-    const source = String(text || '').trim();
-    if (!source) return null;
-
+    let remaining = String(text || '').trim();
+    if (!remaining) return null;
     const calls = [];
-    const markerPattern =
-        /<(?:function_call|tool_call)>\s*([\s\S]*?)\s*<\/(?:function_call|tool_call)>/gi;
-    let match;
-    while ((match = markerPattern.exec(source)) !== null) {
-        const call = normalizeFunctionCall(parseJsonObject(match[1]), declarations, toolMode);
-        if (!call) return null;
-        calls.push(call);
+    // Consume only complete, standalone call documents. Searching arbitrary prose
+    // would execute quoted examples and repeatedly scan malformed opening tags.
+    if (/^<(function_call|tool_call)>/i.test(remaining)) {
+        while (remaining) {
+            const open = /^<(function_call|tool_call)>/i.exec(remaining);
+            if (!open) return null;
+            const closePattern =
+                open[1].toLowerCase() === 'function_call' ? /<\/function_call>/i : /<\/tool_call>/i;
+            const close = closePattern.exec(remaining.slice(open[0].length));
+            if (!close) return null;
+            const contentEnd = open[0].length + close.index;
+            const call = normalizeFunctionCall(
+                parseJsonObject(remaining.slice(open[0].length, contentEnd)),
+                declarations,
+                toolMode
+            );
+            if (!call) return null;
+            calls.push(call);
+            remaining = remaining.slice(contentEnd + close[0].length).trim();
+        }
+        return calls;
     }
-    if (calls.length > 0) return calls;
-
-    const fencedPattern = /```(?:json|function_call|tool_call)?\s*([\s\S]*?)```/gi;
-    while ((match = fencedPattern.exec(source)) !== null) {
-        const call = normalizeFunctionCall(
-            parseJsonObject(match[1].trim()),
-            declarations,
-            toolMode
-        );
-        if (call) calls.push(call);
+    if (remaining.startsWith('```')) {
+        while (remaining) {
+            const open = /^```(?:json|function_call|tool_call)?\s*/i.exec(remaining);
+            if (!open) return null;
+            const end = remaining.indexOf('```', open[0].length);
+            if (end === -1) return null;
+            const call = normalizeFunctionCall(
+                parseJsonObject(remaining.slice(open[0].length, end)),
+                declarations,
+                toolMode
+            );
+            if (!call) return null;
+            calls.push(call);
+            remaining = remaining.slice(end + 3).trim();
+        }
+        return calls;
     }
-    if (calls.length > 0 && source.replace(fencedPattern, '').trim() === '') return calls;
-
-    const looseFunctionCallPattern = /(?:^|\n)function_call\s*\n(\{[^`]*?\})/gi;
-    while ((match = looseFunctionCallPattern.exec(source)) !== null) {
-        const call = normalizeFunctionCall(
-            parseJsonObject(match[1].trim()),
-            declarations,
-            toolMode
-        );
-        if (call) calls.push(call);
-    }
-    if (calls.length > 0) return calls;
-
-    const rawCall = normalizeFunctionCall(parseJsonObject(source), declarations, toolMode);
-    return rawCall ? [rawCall] : null;
+    const looseCall = /^function_call\s*\n([\s\S]+)$/.exec(remaining);
+    const call = normalizeFunctionCall(
+        parseJsonObject(looseCall ? looseCall[1] : remaining),
+        declarations,
+        toolMode
+    );
+    return call ? [call] : null;
 }
 
 function toResponseParts(text, toolContext) {
     const calls = parseFunctionCalls(text, toolContext.declarations, toolContext.toolMode);
+    if (!calls && toolContext.toolMode.mode === 'ANY') {
+        throw new GeminiApiError(
+            502,
+            'Gemini did not return a valid call to an allowed function in ANY mode.'
+        );
+    }
     if (!calls) return text ? [{ text }] : [];
 
     return calls.map((call) => ({
@@ -512,8 +554,9 @@ function toResponseParts(text, toolContext) {
 }
 
 function estimateTokens(text) {
-    const length = Array.from(String(text || '')).length;
-    return Math.max(1, Math.ceil(length / 4));
+    let length = 0;
+    for (const character of String(text || '')) length++;
+    return Math.ceil(length / 4);
 }
 
 function createUsageMetadata(prompt, text) {
@@ -538,7 +581,7 @@ function createGenerateResponse(model, text, toolContext, prompt) {
     const parts = toResponseParts(text, toolContext);
     const response = {
         candidates: [createCandidate(parts)],
-        modelVersion: normalizeModelId(model),
+        modelVersion: MODEL_VERSION,
         usageMetadata: createUsageMetadata(prompt, text),
     };
     if (parts.length === 0) response.promptFeedback = { blockReason: 'OTHER' };
@@ -547,19 +590,31 @@ function createGenerateResponse(model, text, toolContext, prompt) {
 
 function normalizeProviderResult(result) {
     if (typeof result === 'string') return { text: result };
-    if (!result || typeof result !== 'object') return { text: '' };
-    return { text: typeof result.text === 'string' ? result.text : '', ...result };
+    if (!isObject(result)) return { text: '' };
+    return { ...result, text: typeof result.text === 'string' ? result.text : '' };
 }
 
 async function callProvider({ prompt, model, signal, onUpdate, sendMessage }) {
     let result;
     try {
-        result = await sendMessage(prompt, model, [], signal, onUpdate);
+        signal?.throwIfAborted();
+        result = await withAbort(
+            Promise.resolve().then(() => {
+                signal?.throwIfAborted();
+                return sendMessage(prompt, model, [], signal, onUpdate);
+            }),
+            signal
+        );
     } catch (error) {
         if (error?.name === 'AbortError' || signal?.aborted) throw error;
-        throw new GeminiApiError(502, `Gemini upstream request failed: ${getErrorMessage(error)}`, {
-            statusText: 'BAD_GATEWAY',
-        });
+        if (error instanceof GeminiApiError) throw error;
+        throw new GeminiApiError(
+            error instanceof UpstreamError ? error.status : 502,
+            `Gemini upstream request failed: ${getErrorMessage(error)}`,
+            {
+                retryAfter: error instanceof UpstreamError ? error.retryAfter : undefined,
+            }
+        );
     }
     const normalized = normalizeProviderResult(result);
     if (normalized.truncated) {
@@ -571,7 +626,7 @@ async function callProvider({ prompt, model, signal, onUpdate, sendMessage }) {
             }
         );
     }
-    if (!normalized.text) {
+    if (!normalized.text.trim()) {
         throw new GeminiApiError(502, 'Gemini upstream returned no text response.', {
             statusText: 'BAD_GATEWAY',
         });
@@ -580,195 +635,236 @@ async function callProvider({ prompt, model, signal, onUpdate, sendMessage }) {
 }
 
 async function readRequestBody(request, maxBodyBytes) {
-    return await new Promise((resolve, reject) => {
+    const encoding = request.headers['content-encoding'];
+    if (encoding && encoding !== 'identity')
+        throw new GeminiApiError(400, 'Compressed request bodies are not supported.');
+    if (Number(request.headers['content-length']) > maxBodyBytes) {
+        request.resume();
+        throw new GeminiApiError(413, 'Request body exceeds ' + maxBodyBytes + ' bytes.');
+    }
+    return new Promise((resolve, reject) => {
         let size = 0;
-        let tooLarge = false;
-        const chunks = [];
-        request.on('data', (chunk) => {
+        let chunks = [];
+        const cleanup = () => {
+            request.off('data', data);
+            request.off('end', end);
+            request.off('error', fail);
+            request.signal.removeEventListener('abort', abort);
+        };
+        const fail = (error) => {
+            cleanup();
+            chunks = [];
+            request.resume();
+            reject(error);
+        };
+        const abort = () => fail(request.signal.reason);
+        const data = (chunk) => {
             size += chunk.length;
             if (size > maxBodyBytes) {
-                tooLarge = true;
-                return;
-            }
-            chunks.push(chunk);
-        });
-        request.on('aborted', () => reject(new GeminiApiError(499, 'Client closed the request.')));
-        request.on('error', (error) => reject(error));
-        request.on('end', () => {
-            if (tooLarge) {
-                reject(new GeminiApiError(413, `Request body exceeds ${maxBodyBytes} bytes.`));
-                return;
-            }
-            if (size === 0) {
-                reject(new GeminiApiError(400, 'Request body must be a JSON object.'));
-                return;
-            }
-            const raw = Buffer.concat(chunks).toString('utf8');
+                fail(new GeminiApiError(413, 'Request body exceeds ' + maxBodyBytes + ' bytes.'));
+            } else chunks.push(chunk);
+        };
+        const end = () => {
+            cleanup();
             try {
+                const raw = new TextDecoder('utf-8', { fatal: true }).decode(
+                    Buffer.concat(chunks, size)
+                );
+                chunks = [];
                 const parsed = JSON.parse(raw);
                 if (!isObject(parsed)) throw new Error('not an object');
                 resolve(parsed);
             } catch {
-                reject(new GeminiApiError(400, 'Request body must contain valid JSON.'));
+                reject(
+                    new GeminiApiError(400, 'Request body must contain a valid UTF-8 JSON object.')
+                );
             }
-        });
+        };
+        request.on('data', data);
+        request.once('end', end);
+        request.once('error', fail);
+        request.signal.addEventListener('abort', abort, { once: true });
+        if (request.signal.aborted) abort();
     });
 }
 
-function getActionPath(pathname) {
-    const parsed = parseModelPath(pathname);
-    if (!parsed) return null;
-    return parsed;
-}
-
-function getRequestModel(model) {
-    const normalized = normalizeModelId(model);
-    const baseModel = normalized.split('@', 1)[0];
-    if (!getModelNames().includes(baseModel)) {
-        throw new GeminiApiError(404, `Model ${baseModel} not found.`);
+function getRequestModel(model, adjustments = []) {
+    let normalized = normalizeModelId(model);
+    const suffixIndex = normalized.indexOf('@');
+    if (suffixIndex !== -1) {
+        const base = normalized.slice(0, suffixIndex);
+        const suffix = normalized.slice(suffixIndex);
+        const parsed = /^@think=(-?\d+)$/.exec(suffix);
+        const value = parsed ? Number(parsed[1]) : NaN;
+        normalized = Number.isSafeInteger(value)
+            ? base + '@think=' + Math.min(4, Math.max(0, value))
+            : base;
+        if (normalized !== base + suffix) recordAdjustment(adjustments, 'model.@think');
+    }
+    try {
+        resolveNoAuthModel(normalized);
+    } catch (error) {
+        throw new GeminiApiError(error.status || 400, error.message, { param: 'model' });
     }
     return normalized;
 }
 
-async function handleGenerate(request, response, options, model, method) {
-    const body = await readRequestBody(request, options.maxBodyBytes);
+function requireContents(body) {
     if (!Array.isArray(body.contents) || body.contents.length === 0) {
         throw new GeminiApiError(400, 'contents must be a non-empty array.', { param: 'contents' });
-    }
-
-    const context = buildPrompt(body);
-    const targetModel = getRequestModel(model);
-    const stream = method === 'streamGenerateContent';
-
-    if (!stream) {
-        const result = await callProvider({
-            prompt: context.prompt,
-            model: targetModel,
-            signal: request.signal,
-            sendMessage: options.sendMessage,
-        });
-        writeJson(
-            response,
-            200,
-            createGenerateResponse(targetModel, result.text, context, context.prompt)
-        );
-        return;
-    }
-
-    response.statusCode = 200;
-    response.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
-    response.setHeader('Connection', 'keep-alive');
-    response.setHeader('X-Accel-Buffering', 'no');
-    response.flushHeaders?.();
-
-    const controller = new AbortController();
-    const abort = () => controller.abort();
-    request.once('aborted', abort);
-    response.once('close', () => {
-        if (!response.writableEnded) controller.abort();
-    });
-    const heartbeat = setInterval(() => {
-        if (response.writableEnded || response.destroyed) return;
-        try {
-            response.write(': keep-alive\n\n');
-        } catch {
-            controller.abort();
-        }
-    }, 10_000);
-    heartbeat.unref?.();
-
-    const shouldBufferForTools =
-        context.declarations.length > 0 && context.toolMode.mode !== 'NONE';
-    let latestText = '';
-    let streamedText = '';
-
-    try {
-        const result = await callProvider({
-            prompt: context.prompt,
-            model: targetModel,
-            signal: controller.signal,
-            sendMessage: options.sendMessage,
-            onUpdate: shouldBufferForTools
-                ? undefined
-                : (nextText) => {
-                      const next = String(nextText || '');
-                      const delta = next.startsWith(streamedText)
-                          ? next.slice(streamedText.length)
-                          : next;
-                      streamedText = next;
-                      latestText = next;
-                      if (delta) {
-                          writeSse(response, {
-                              candidates: [
-                                  {
-                                      content: { role: 'model', parts: [{ text: delta }] },
-                                      index: 0,
-                                  },
-                              ],
-                              modelVersion: targetModel,
-                          });
-                      }
-                  },
-        });
-        latestText = result.text;
-
-        if (shouldBufferForTools) {
-            const parts = toResponseParts(result.text, context);
-            writeSse(response, {
-                candidates: [createCandidate(parts)],
-                modelVersion: targetModel,
-                usageMetadata: createUsageMetadata(context.prompt, result.text),
-            });
-        } else if (latestText.startsWith(streamedText) && latestText.length > streamedText.length) {
-            writeSse(response, {
-                candidates: [
-                    {
-                        content: {
-                            role: 'model',
-                            parts: [{ text: latestText.slice(streamedText.length) }],
-                        },
-                        index: 0,
-                    },
-                ],
-                modelVersion: targetModel,
-            });
-        }
-
-        if (!shouldBufferForTools) {
-            writeSse(response, {
-                candidates: [createCandidate([])],
-                modelVersion: targetModel,
-                usageMetadata: createUsageMetadata(context.prompt, latestText),
-            });
-        }
-        endSse(response);
-    } catch (error) {
-        if (controller.signal.aborted || error?.name === 'AbortError') {
-            if (!response.writableEnded) response.end();
-            return;
-        }
-        writeSse(response, createErrorBody(error));
-        endSse(response);
-    } finally {
-        clearInterval(heartbeat);
-        request.off('aborted', abort);
     }
 }
 
-async function handleCountTokens(request, response, options) {
+async function handleGenerate(request, response, options, model, method) {
+    const adjustments = [];
+    const requestedModel = getRequestModel(model, adjustments);
     const body = await readRequestBody(request, options.maxBodyBytes);
-    if (!Array.isArray(body.contents) || body.contents.length === 0) {
-        throw new GeminiApiError(400, 'contents must be a non-empty array.', { param: 'contents' });
+    requireContents(body);
+    const context = buildPrompt(body, adjustments);
+    const targetModel = applyThinking(requestedModel, context.thinking, adjustments);
+    setOptionHeaders(response, adjustments, targetModel);
+    if (options.state.active >= options.maxConcurrentRequests) {
+        throw new GeminiApiError(429, 'Too many active generation requests.', { retryAfter: '1' });
     }
-    const context = buildPrompt(body);
+    request.signal.throwIfAborted();
+    options.state.active++;
+    const deadline = createDeadline(
+        request.signal,
+        options.requestTimeoutMs,
+        new GeminiApiError(504, 'Generation request timed out.')
+    );
+    const signal = deadline.signal;
+    let heartbeat;
+    response.setHeader('X-Gemini-Token-Count', 'estimated');
+    try {
+        if (method !== 'streamGenerateContent') {
+            const result = await callProvider({
+                prompt: context.prompt,
+                model: targetModel,
+                signal,
+                sendMessage: options.sendMessage,
+            });
+            writeJson(
+                response,
+                200,
+                createGenerateResponse(targetModel, result.text, context, context.prompt)
+            );
+            return;
+        }
+        response.statusCode = 200;
+        response.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+        response.setHeader('Connection', 'keep-alive');
+        response.setHeader('X-Accel-Buffering', 'no');
+        response.flushHeaders();
+        const writer = createSseWriter(response, signal, options.maxPendingSseBytes);
+        heartbeat = setInterval(() => {
+            if (
+                !signal.aborted &&
+                !response.destroyed &&
+                !response.writableEnded &&
+                writer.isIdle() &&
+                response.writableLength === 0
+            )
+                response.write(': keep-alive\n\n');
+        }, 10_000);
+        heartbeat.unref?.();
+        const bufferTools = context.declarations.length > 0 && context.toolMode.mode !== 'NONE';
+        let streamedText = '';
+        const update = (next) => {
+            signal.throwIfAborted();
+            if (typeof next !== 'string')
+                throw new GeminiApiError(502, 'Gemini returned an invalid text update.');
+            if (!next.startsWith(streamedText))
+                throw new GeminiApiError(502, 'Gemini revised text that was already streamed.');
+            const delta = next.slice(streamedText.length);
+            streamedText = next;
+            if (!delta) return Promise.resolve();
+            return writer.write({
+                candidates: [{ content: { role: 'model', parts: [{ text: delta }] }, index: 0 }],
+                modelVersion: MODEL_VERSION,
+            });
+        };
+        try {
+            const result = await callProvider({
+                prompt: context.prompt,
+                model: targetModel,
+                signal,
+                sendMessage: options.sendMessage,
+                onUpdate: bufferTools ? undefined : update,
+            });
+            if (bufferTools) {
+                await writer.write({
+                    candidates: [createCandidate(toResponseParts(result.text, context))],
+                    modelVersion: MODEL_VERSION,
+                    usageMetadata: createUsageMetadata(context.prompt, result.text),
+                });
+            } else {
+                await update(result.text);
+                await writer.write({
+                    candidates: [createCandidate([])],
+                    modelVersion: MODEL_VERSION,
+                    usageMetadata: createUsageMetadata(context.prompt, result.text),
+                });
+            }
+            await writer.flush();
+            endSse(response);
+        } catch (error) {
+            await writer.flush().catch(() => {});
+            if (!request.signal.aborted && !response.destroyed && !response.writableEnded) {
+                response.write('data: ' + JSON.stringify(createErrorBody(error)) + '\n\n');
+            }
+            endSse(response);
+        }
+    } finally {
+        clearInterval(heartbeat);
+        deadline.dispose();
+        options.state.active--;
+    }
+}
+
+async function handleCountTokens(request, response, options, model) {
+    const adjustments = [];
+    const targetModel = getRequestModel(model, adjustments);
+    const body = await readRequestBody(request, options.maxBodyBytes);
+    let input = body;
+    const nested = body.generateContentRequest ?? body.generate_content_request;
+    if (nested !== undefined) {
+        if (!isObject(nested)) recordAdjustment(adjustments, 'generateContentRequest');
+        else {
+            if (body.contents !== undefined) recordAdjustment(adjustments, 'contents');
+            if (nested.model && normalizeModelId(nested.model) !== targetModel)
+                recordAdjustment(adjustments, 'generateContentRequest.model');
+            input = nested;
+        }
+    }
+    requireContents(input);
+    const context = buildPrompt(input, adjustments);
+    const effectiveModel = applyThinking(targetModel, context.thinking, adjustments);
+    setOptionHeaders(response, adjustments, effectiveModel);
+    const totalTokens = estimateTokens(context.prompt);
+    response.setHeader('X-Gemini-Token-Count', 'estimated');
     writeJson(response, 200, {
-        totalTokens: estimateTokens(context.prompt),
-        promptTokensDetails: [{ modality: 'TEXT', tokenCount: estimateTokens(context.prompt) }],
+        totalTokens,
+        promptTokensDetails: [{ modality: 'TEXT', tokenCount: totalTokens }],
     });
+}
+
+function authorize(request, url, options) {
+    if (!options.apiKey) return;
+    const authorization = request.headers.authorization || '';
+    const supplied =
+        (authorization.startsWith('Bearer ') ? authorization.slice(7) : '') ||
+        request.headers['x-goog-api-key'] ||
+        request.headers['x-api-key'] ||
+        url.searchParams.get('key') ||
+        '';
+    const digest = (value) => createHash('sha256').update(String(value)).digest();
+    if (!timingSafeEqual(digest(supplied), options.apiKeyHash))
+        throw new GeminiApiError(401, 'Invalid or missing API key.');
 }
 
 async function routeRequest(request, response, options) {
-    const url = new URL(request.url || '/', `http://${request.headers.host || 'localhost'}`);
+    const url = new URL(request.url || '/', 'http://localhost');
     const pathname = normalizePath(url.pathname);
 
     if (request.method === 'OPTIONS') {
@@ -784,11 +880,13 @@ async function routeRequest(request, response, options) {
         writeJson(response, 200, {
             status: 'ok',
             service: 'gemini-nexus-2api',
-            auth: 'none',
+            auth: options.apiKey ? 'api-key' : 'none',
             protocol: 'gemini',
         });
         return;
     }
+
+    authorize(request, url, options);
 
     if (
         request.method === 'GET' &&
@@ -798,15 +896,16 @@ async function routeRequest(request, response, options) {
         return;
     }
 
-    const action = getActionPath(pathname);
+    const action = parseModelPath(pathname);
     if (!action) {
         throw new GeminiApiError(404, 'Route not found.');
     }
 
     if (request.method === 'GET' && action.method === null) {
-        const knownModel = getModelNames().includes(normalizeModelId(action.model));
-        if (!knownModel) throw new GeminiApiError(404, `Model ${action.model} not found.`);
-        writeJson(response, 200, modelResource(action.model));
+        const adjustments = [];
+        const model = getRequestModel(action.model, adjustments);
+        setOptionHeaders(response, adjustments, model);
+        writeJson(response, 200, modelResource(model));
         return;
     }
 
@@ -819,7 +918,7 @@ async function routeRequest(request, response, options) {
         return;
     }
     if (action.method === 'countTokens') {
-        await handleCountTokens(request, response, options);
+        await handleCountTokens(request, response, options, action.model);
         return;
     }
 
@@ -827,30 +926,115 @@ async function routeRequest(request, response, options) {
 }
 
 /**
- * Creates a pure Gemini-format HTTP server backed by the project's anonymous
- * Gemini Web provider. No API key or Authorization header is required.
+ * Creates a Gemini-format HTTP server backed by the anonymous Gemini Web provider.
+ * Local API-key protection is optional and independent of upstream authentication.
  */
 export function createGemini2ApiServer(options = {}) {
     const resolvedOptions = {
         maxBodyBytes: DEFAULT_MAX_BODY_BYTES,
-        sendMessage: sendNoAuthGeminiMessage,
+        requestTimeoutMs: 180_000,
+        maxConcurrentRequests: 8,
+        maxPendingSseBytes: 1024 * 1024,
         ...options,
+        state: { active: 0 },
     };
-
-    if (typeof resolvedOptions.sendMessage !== 'function') {
-        throw new TypeError('sendMessage must be a function.');
+    for (const key of [
+        'maxBodyBytes',
+        'requestTimeoutMs',
+        'maxConcurrentRequests',
+        'maxPendingSseBytes',
+    ]) {
+        positiveInteger(resolvedOptions[key], key);
     }
-
-    return createServer(async (request, response) => {
-        setCorsHeaders(response);
-        try {
-            await routeRequest(request, response, resolvedOptions);
-        } catch (error) {
-            if (error?.name === 'AbortError' || response.writableEnded) return;
-            if (!response.headersSent) setCorsHeaders(response);
-            writeError(response, error);
+    if (resolvedOptions.apiKey !== undefined && typeof resolvedOptions.apiKey !== 'string')
+        throw new TypeError('apiKey must be a string.');
+    if (resolvedOptions.apiKey)
+        resolvedOptions.apiKeyHash = createHash('sha256').update(resolvedOptions.apiKey).digest();
+    if (
+        resolvedOptions.allowedOrigins !== undefined &&
+        (!Array.isArray(resolvedOptions.allowedOrigins) ||
+            resolvedOptions.allowedOrigins.some((origin) => {
+                if (origin === '*') return false;
+                try {
+                    const url = new URL(origin);
+                    return !['http:', 'https:'].includes(url.protocol) || url.origin !== origin;
+                } catch {
+                    return true;
+                }
+            }))
+    )
+        throw new TypeError('allowedOrigins must contain exact HTTP(S) origins or *.');
+    const ownedProvider =
+        resolvedOptions.sendMessage == null
+            ? createNoAuthGeminiProvider({ generationTimeoutMs: resolvedOptions.requestTimeoutMs })
+            : null;
+    resolvedOptions.sendMessage ??= ownedProvider;
+    if (typeof resolvedOptions.sendMessage !== 'function')
+        throw new TypeError('sendMessage must be a function.');
+    const controllers = new Set();
+    let stopping = false;
+    const server = createServer(
+        {
+            requestTimeout: 30_000,
+            headersTimeout: 10_000,
+            keepAliveTimeout: 5_000,
+            maxHeaderSize: 16_384,
+        },
+        async (request, response) => {
+            const controller = new AbortController();
+            controllers.add(controller);
+            request.signal = controller.signal;
+            const abort = () =>
+                controller.abort(new DOMException('Client disconnected', 'AbortError'));
+            const close = () => {
+                if (!response.writableEnded) abort();
+            };
+            request.once('aborted', abort);
+            request.on('error', abort);
+            response.once('close', close);
+            response.on('error', abort);
+            try {
+                setCorsHeaders(request, response, resolvedOptions);
+                if (stopping) throw new GeminiApiError(503, 'Server is shutting down.');
+                await routeRequest(request, response, resolvedOptions);
+            } catch (error) {
+                if (controller.signal.aborted || response.writableEnded || response.destroyed)
+                    return;
+                if (response.headersSent) {
+                    response.destroy();
+                    return;
+                }
+                writeError(response, error);
+            } finally {
+                controllers.delete(controller);
+                request.off('aborted', abort);
+                response.off('close', close);
+                if (!request.complete) request.resume();
+            }
         }
-    });
+    );
+    server.once('close', () => ownedProvider?.close());
+    let shutdownPromise;
+    server.shutdown = ({ gracePeriodMs = 10_000 } = {}) => {
+        positiveInteger(gracePeriodMs, 'gracePeriodMs');
+        if (shutdownPromise) return shutdownPromise;
+        stopping = true;
+        shutdownPromise = new Promise((resolve, reject) => {
+            const timer = setTimeout(() => {
+                for (const controller of controllers)
+                    controller.abort(new GeminiApiError(503, 'Server is shutting down.'));
+                server.closeAllConnections();
+            }, gracePeriodMs);
+            timer.unref?.();
+            server.close((error) => {
+                clearTimeout(timer);
+                error ? reject(error) : resolve();
+            });
+            server.closeIdleConnections();
+        });
+        return shutdownPromise;
+    };
+    return server;
 }
 
 export async function startGemini2ApiServer(options = {}) {
@@ -858,11 +1042,33 @@ export async function startGemini2ApiServer(options = {}) {
     const configuredPort =
         options.port ?? process.env.GEMINI_2API_PORT ?? process.env.PORT ?? DEFAULT_PORT;
     const port = Number(configuredPort);
-    if (!Number.isInteger(port) || port < 0 || port > 65_535) {
+    if (
+        !['number', 'string'].includes(typeof configuredPort) ||
+        (typeof configuredPort === 'string' && !/^\d+$/.test(configuredPort)) ||
+        !Number.isInteger(port) ||
+        port < 0 ||
+        port > 65_535
+    ) {
         throw new TypeError(`Invalid port: ${configuredPort}`);
     }
 
-    const server = createGemini2ApiServer(options);
+    const server = createGemini2ApiServer({
+        apiKey: process.env.GEMINI_2API_API_KEY,
+        ...(process.env.GEMINI_2API_ALLOWED_ORIGINS !== undefined
+            ? {
+                  allowedOrigins: process.env.GEMINI_2API_ALLOWED_ORIGINS.split(',')
+                      .map((s) => s.trim())
+                      .filter(Boolean),
+              }
+            : {}),
+        ...(process.env.GEMINI_2API_TIMEOUT_MS !== undefined
+            ? { requestTimeoutMs: Number(process.env.GEMINI_2API_TIMEOUT_MS) }
+            : {}),
+        ...(process.env.GEMINI_2API_MAX_CONCURRENT !== undefined
+            ? { maxConcurrentRequests: Number(process.env.GEMINI_2API_MAX_CONCURRENT) }
+            : {}),
+        ...options,
+    });
     await new Promise((resolve, reject) => {
         const onError = (error) => {
             server.off('listening', onListening);

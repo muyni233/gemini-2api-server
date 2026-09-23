@@ -4,10 +4,12 @@
     "private": true,
     "type": "module",
     "engines": {
-        "node": ">=18"
+        "node": "^22.19.0 || >=24.6.0"
     },
     "scripts": {
         "start": "node --max-http-header-size=131072 src/index.js",
-        "test": "node --test"
+        "test": "node --test",
+        "test:coverage": "node --test --experimental-test-coverage",
+        "probe:upstream": "node --max-http-header-size=131072 scripts/probe_upstream.js"
     }
 }
